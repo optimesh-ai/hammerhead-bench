@@ -1,0 +1,28 @@
+{
+  "default": {
+    "10.0.0.1/32": [
+      {
+        "prefix": "10.0.0.1/32",
+        "protocol": "connected",
+        "distance": 0,
+        "metric": 0,
+        "installed": true,
+        "selected": true,
+        "nexthops": [{"interfaceName": "lo", "active": true}]
+      }
+    ]
+  },
+  "CUSTOMER_RED": {
+    "192.168.10.0/24": [
+      {
+        "prefix": "192.168.10.0/24",
+        "protocol": "bgp",
+        "distance": 200,
+        "metric": 0,
+        "installed": true,
+        "selected": true,
+        "nexthops": [{"ip": "10.0.0.9", "interfaceName": "eth2", "active": true}]
+      }
+    ]
+  }
+}

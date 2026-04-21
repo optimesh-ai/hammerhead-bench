@@ -34,9 +34,8 @@ install:
 preflight: install
 	$(PYTHON) scripts/preflight.py
 
-smoke:
-	@echo "[smoke] phase 2 deliverable. See README.md 'Development order'."
-	@exit 1
+smoke: install
+	$(UV) run hammerhead-bench smoke $(SMOKE_ARGS)
 
 bench:
 	@echo "[bench] phase 7+ deliverable. See README.md 'Development order'."

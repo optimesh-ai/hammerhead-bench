@@ -1,0 +1,69 @@
+{
+  "default": {
+    "10.0.0.1/32": [
+      {
+        "prefix": "10.0.0.1/32",
+        "protocol": "connected",
+        "distance": 0,
+        "metric": 0,
+        "installed": true,
+        "selected": true,
+        "destSelected": true,
+        "nexthops": [
+          {"directlyConnected": true, "interfaceName": "lo", "active": true, "fib": true}
+        ]
+      }
+    ],
+    "10.0.0.2/32": [
+      {
+        "prefix": "10.0.0.2/32",
+        "protocol": "bgp",
+        "distance": 200,
+        "metric": 0,
+        "installed": true,
+        "selected": true,
+        "destSelected": true,
+        "nexthops": [
+          {"ip": "10.0.12.2", "interfaceName": "eth1", "active": true, "fib": true}
+        ]
+      },
+      {
+        "prefix": "10.0.0.2/32",
+        "protocol": "static",
+        "distance": 1,
+        "metric": 0,
+        "installed": false,
+        "selected": false,
+        "nexthops": [
+          {"ip": "10.0.12.2", "interfaceName": "eth1", "active": true}
+        ]
+      }
+    ],
+    "10.0.12.0/30": [
+      {
+        "prefix": "10.0.12.0/30",
+        "protocol": "connected",
+        "distance": 0,
+        "metric": 0,
+        "installed": true,
+        "selected": true,
+        "nexthops": [
+          {"directlyConnected": true, "interfaceName": "eth1", "active": true, "fib": true}
+        ]
+      }
+    ],
+    "169.254.0.0/16": [
+      {
+        "prefix": "169.254.0.0/16",
+        "protocol": "kernel",
+        "distance": 0,
+        "metric": 0,
+        "installed": true,
+        "selected": true,
+        "nexthops": [
+          {"interfaceName": "eth0", "active": true, "fib": true}
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,35 @@
+frr defaults traditional
+hostname {{ node.name }}
+no ipv6 forwarding
+!
+interface lo
+ ip address {{ params.loopback }}/32
+!
+{% for iface in node.interfaces %}
+interface {{ iface.name }}
+{%- if iface.description %}
+ description {{ iface.description }}
+{%- endif %}
+{%- if iface.ip %}
+ ip address {{ iface.ip }}
+{%- endif %}
+!
+{% endfor %}
+ip route {{ params.peer.loopback }}/32 {{ params.peer.transit_ip }}
+!
+router bgp {{ params.asn }}
+ bgp router-id {{ params.loopback }}
+ no bgp ebgp-requires-policy
+ bgp log-neighbor-changes
+ neighbor {{ params.peer.loopback }} remote-as {{ params.asn }}
+ neighbor {{ params.peer.loopback }} update-source lo
+ neighbor {{ params.peer.loopback }} description iBGP to {{ params.peer.name }}
+ !
+ address-family ipv4 unicast
+  network {{ params.loopback }}/32
+  neighbor {{ params.peer.loopback }} activate
+  neighbor {{ params.peer.loopback }} next-hop-self
+ exit-address-family
+!
+line vty
+!

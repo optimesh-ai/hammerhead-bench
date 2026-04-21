@@ -24,12 +24,34 @@ Normalization rules, enforced by :func:`canonicalize_node_fib`:
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 Protocol = Literal["bgp", "ospf", "isis", "static", "connected", "local", "rip"]
 Source = Literal["vendor", "batfish", "hammerhead"]
+
+# FRR's `show ip route json` exposes a handful of protocols we don't model.
+# Keep the map explicit so schema drift (new FRR version adds a protocol)
+# surfaces as a ValueError instead of silently dropping routes.
+_FRR_PROTOCOL_MAP: dict[str, Protocol] = {
+    "bgp": "bgp",
+    "ospf": "ospf",
+    "isis": "isis",
+    "static": "static",
+    "connected": "connected",
+    "local": "local",
+    "rip": "rip",
+}
+_FRR_PROTOCOL_SKIP: frozenset[str] = frozenset(
+    {
+        "kernel",  # routes from the host kernel (eth0 mgmt, docker bridge)
+        "table",   # non-main kernel table imports
+        "system",  # clab-internal plumbing
+        "nhrp",    # not benchmarked
+        "babel",   # not benchmarked
+    }
+)
 
 
 class NextHop(BaseModel):
@@ -124,3 +146,180 @@ def _is_loopback_host(r: Route) -> bool:
         if nh.interface and nh.interface.lower().startswith(("lo", "loopback")):
             return True
     return False
+
+
+# --- FRR JSON parsing ------------------------------------------------------
+
+
+def parse_frr_route_json(
+    data: dict[str, Any],
+    *,
+    node_name: str,
+    source: Source = "vendor",
+) -> list[NodeFib]:
+    """Convert FRR's ``show ip route vrf all json`` output to canonical NodeFibs.
+
+    Returns one ``NodeFib`` per VRF. Only entries with ``selected=True`` AND
+    ``installed=True`` are kept (those are what zebra actually programmed into
+    the kernel FIB). Protocols in :data:`_FRR_PROTOCOL_SKIP` are dropped
+    silently; unknown protocols raise ``ValueError`` so FRR version drift
+    surfaces loudly.
+
+    FRR emits two slightly different shapes:
+
+    - single-VRF flat:  ``{"<prefix>": [<entries>], ...}``
+    - multi-VRF nested: ``{"<vrf>": {"<prefix>": [<entries>], ...}, ...}``
+
+    Detected by inspecting the first value: a list means flat, a dict means
+    nested.
+    """
+    if not data:
+        return [NodeFib(node=node_name, vrf="default", source=source, routes=[])]
+
+    first_val = next(iter(data.values()))
+    is_nested = isinstance(first_val, dict)
+    vrf_map: dict[str, dict[str, list[dict[str, Any]]]] = (
+        data if is_nested else {"default": data}  # type: ignore[dict-item]
+    )
+
+    results: list[NodeFib] = []
+    for vrf_name, prefix_map in vrf_map.items():
+        routes: list[Route] = []
+        for prefix, entries in prefix_map.items():
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                parsed = _parse_frr_route_entry(prefix, entry)
+                if parsed is not None:
+                    routes.append(parsed)
+        results.append(
+            NodeFib(node=node_name, vrf=canonicalize_vrf(vrf_name), source=source, routes=routes)
+        )
+    return results
+
+
+def _parse_frr_route_entry(prefix: str, entry: dict[str, Any]) -> Route | None:
+    """Convert one FRR route entry to a ``Route`` or return None to skip it.
+
+    Skip rules:
+    - ``selected`` is False or missing.
+    - ``installed`` is False (entry lost the best-path race, or not yet in FIB).
+    - Protocol is in :data:`_FRR_PROTOCOL_SKIP`.
+
+    Raises ``ValueError`` if the protocol is unknown (neither mapped nor
+    skipped) so FRR version drift surfaces loudly.
+    """
+    if not entry.get("selected") or not entry.get("installed"):
+        return None
+    raw_proto = (entry.get("protocol") or "").lower()
+    if raw_proto in _FRR_PROTOCOL_SKIP:
+        return None
+    protocol = _FRR_PROTOCOL_MAP.get(raw_proto)
+    if protocol is None:
+        raise ValueError(
+            f"unknown FRR protocol {raw_proto!r} for prefix {prefix!r}; "
+            "update _FRR_PROTOCOL_MAP or _FRR_PROTOCOL_SKIP"
+        )
+    nhs: list[NextHop] = []
+    for nh in entry.get("nexthops", []):
+        if not isinstance(nh, dict):
+            continue
+        if nh.get("active") is False:
+            continue
+        ip = nh.get("ip")
+        iface = nh.get("interfaceName")
+        if ip is None and iface is None:
+            continue
+        nhs.append(NextHop(ip=ip, interface=iface))
+    return Route(
+        prefix=prefix,
+        protocol=protocol,
+        next_hops=nhs,
+        admin_distance=entry.get("distance"),
+        metric=entry.get("metric"),
+    )
+
+
+def merge_bgp_attributes(fib: NodeFib, bgp_json: dict[str, Any]) -> NodeFib:
+    """Return a new ``NodeFib`` with AS_PATH / LOCAL_PREF / MED populated on BGP routes.
+
+    ``bgp_json`` is the raw ``show ip bgp vrf all json`` output. Each VRF-scoped
+    block has a ``routes`` dict of ``{prefix: [path_info, ...]}`` where the path
+    marked ``bestpath: true`` is what ended up in the FIB.
+
+    Non-BGP routes and BGP routes without a matching entry are passed through
+    unchanged. Communities are not populated in phase 2 (requires a follow-up
+    ``show ip bgp <prefix> json`` per route to get the full attribute set).
+    """
+    # Collapse bgp_json into a per-(vrf, prefix) -> best-path dict.
+    best: dict[tuple[str, str], dict[str, Any]] = {}
+    blocks = _walk_bgp_blocks(bgp_json)
+    for vrf_name, block in blocks:
+        vrf = canonicalize_vrf(vrf_name)
+        for prefix, paths in block.get("routes", {}).items():
+            if not isinstance(paths, list):
+                continue
+            for p in paths:
+                if p.get("bestpath") is True:
+                    best[(vrf, prefix)] = p
+                    break
+
+    target_vrf = canonicalize_vrf(fib.vrf)
+    updated: list[Route] = []
+    for r in fib.routes:
+        if r.protocol != "bgp":
+            updated.append(r)
+            continue
+        pi = best.get((target_vrf, r.prefix))
+        if pi is None:
+            updated.append(r)
+            continue
+        updated.append(
+            r.model_copy(
+                update={
+                    "as_path": _parse_as_path(pi.get("path")),
+                    "local_pref": pi.get("locPrf"),
+                    "med": pi.get("metric"),
+                }
+            )
+        )
+    return fib.model_copy(update={"routes": updated})
+
+
+def _walk_bgp_blocks(bgp_json: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Yield ``(vrf_name, block)`` pairs from ``show ip bgp vrf all json``.
+
+    FRR emits either a single-VRF shape (top-level has ``routes``) or a
+    nested ``{"<vrf>": {...}}`` map. Detect by presence of ``routes``.
+    """
+    if not isinstance(bgp_json, dict) or not bgp_json:
+        return []
+    if "routes" in bgp_json:
+        return [(bgp_json.get("vrfName", "default"), bgp_json)]
+    blocks: list[tuple[str, dict[str, Any]]] = []
+    for k, v in bgp_json.items():
+        if isinstance(v, dict) and "routes" in v:
+            blocks.append((v.get("vrfName", k), v))
+    return blocks
+
+
+def _parse_as_path(path: Any) -> list[int] | None:
+    """Convert FRR's space-separated AS_PATH string to a list of ints.
+
+    Returns ``None`` for missing paths, ``[]`` for an empty iBGP path.
+    Non-integer tokens (confederation segments, AS_SET) are skipped — those
+    are rare enough in phase-2 topologies that we can defer full grammar
+    support until a real diff exposes the gap.
+    """
+    if path is None:
+        return None
+    if not isinstance(path, str):
+        return None
+    tokens = path.strip().split()
+    out: list[int] = []
+    for t in tokens:
+        try:
+            out.append(int(t))
+        except ValueError:
+            continue
+    return out

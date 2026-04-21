@@ -1,0 +1,18 @@
+name: hh-bench-{{ spec.name }}
+
+topology:
+  nodes:
+{%- for node in spec.nodes %}
+    {{ node.name }}:
+      kind: linux
+      image: {{ node.adapter.image }}
+      memory: {{ node.adapter.memory_mb }}m
+      binds:
+        - configs/{{ node.name }}/frr.conf:/etc/frr/frr.conf
+        - configs/{{ node.name }}/daemons:/etc/frr/daemons
+{%- endfor %}
+
+  links:
+{%- for link in spec.links %}
+    - endpoints: ["{{ link.a[0] }}:{{ link.a[1] }}", "{{ link.b[0] }}:{{ link.b[1] }}"]
+{%- endfor %}

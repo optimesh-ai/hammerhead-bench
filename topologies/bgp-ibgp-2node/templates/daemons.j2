@@ -1,0 +1,44 @@
+{# FRR daemons file. zebra is always on (it programs the kernel FIB + vtysh).
+   vtysh_enable must be on so `docker exec ... vtysh` works. Protocol daemons
+   are toggled from node.params.enabled_daemons. Keep in alphabetical order so
+   a rendering diff is easy to read. #}
+zebra=yes
+babeld={{ "yes" if "babeld" in params.enabled_daemons else "no" }}
+bfdd={{ "yes" if "bfdd" in params.enabled_daemons else "no" }}
+bgpd={{ "yes" if "bgpd" in params.enabled_daemons else "no" }}
+eigrpd={{ "yes" if "eigrpd" in params.enabled_daemons else "no" }}
+fabricd={{ "yes" if "fabricd" in params.enabled_daemons else "no" }}
+isisd={{ "yes" if "isisd" in params.enabled_daemons else "no" }}
+ldpd={{ "yes" if "ldpd" in params.enabled_daemons else "no" }}
+nhrpd={{ "yes" if "nhrpd" in params.enabled_daemons else "no" }}
+ospfd={{ "yes" if "ospfd" in params.enabled_daemons else "no" }}
+ospf6d={{ "yes" if "ospf6d" in params.enabled_daemons else "no" }}
+pathd={{ "yes" if "pathd" in params.enabled_daemons else "no" }}
+pbrd={{ "yes" if "pbrd" in params.enabled_daemons else "no" }}
+pimd={{ "yes" if "pimd" in params.enabled_daemons else "no" }}
+ripd={{ "yes" if "ripd" in params.enabled_daemons else "no" }}
+ripngd={{ "yes" if "ripngd" in params.enabled_daemons else "no" }}
+sharpd={{ "yes" if "sharpd" in params.enabled_daemons else "no" }}
+staticd={{ "yes" if "staticd" in params.enabled_daemons else "no" }}
+vrrpd={{ "yes" if "vrrpd" in params.enabled_daemons else "no" }}
+
+vtysh_enable=yes
+zebra_options="  -A 127.0.0.1 -s 90000000"
+bgpd_options="   -A 127.0.0.1"
+ospfd_options="  -A 127.0.0.1"
+ospf6d_options=" -A ::1"
+ripd_options="   -A 127.0.0.1"
+ripngd_options=" -A ::1"
+isisd_options="  -A 127.0.0.1"
+pimd_options="   -A 127.0.0.1"
+ldpd_options="   -A 127.0.0.1"
+nhrpd_options="  -A 127.0.0.1"
+eigrpd_options=" -A 127.0.0.1"
+babeld_options=" -A 127.0.0.1"
+sharpd_options=" -A 127.0.0.1"
+pbrd_options="   -A 127.0.0.1"
+staticd_options="-A 127.0.0.1"
+bfdd_options="   -A 127.0.0.1"
+fabricd_options="-A 127.0.0.1"
+vrrpd_options="  -A 127.0.0.1"
+pathd_options="  -A 127.0.0.1"
