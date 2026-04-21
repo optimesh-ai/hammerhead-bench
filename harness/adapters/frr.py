@@ -52,6 +52,7 @@ class FrrAdapter(VendorAdapter):
     memory_mb: int = FRR_DEFAULT_MEMORY_MB
 
     kind: str = "frr"
+    config_template_names: tuple[str, ...] = ("frr.conf.j2", "daemons.j2")
 
     def render_clab_node(self, name: str, config_path: Path) -> dict:
         """Return the dict that goes under ``topology.nodes[<name>]`` in clab YAML.

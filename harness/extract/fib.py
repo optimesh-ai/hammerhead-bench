@@ -46,10 +46,10 @@ _FRR_PROTOCOL_MAP: dict[str, Protocol] = {
 _FRR_PROTOCOL_SKIP: frozenset[str] = frozenset(
     {
         "kernel",  # routes from the host kernel (eth0 mgmt, docker bridge)
-        "table",   # non-main kernel table imports
+        "table",  # non-main kernel table imports
         "system",  # clab-internal plumbing
-        "nhrp",    # not benchmarked
-        "babel",   # not benchmarked
+        "nhrp",  # not benchmarked
+        "babel",  # not benchmarked
     }
 )
 
@@ -238,6 +238,178 @@ def _parse_frr_route_entry(prefix: str, entry: dict[str, Any]) -> Route | None:
         admin_distance=entry.get("distance"),
         metric=entry.get("metric"),
     )
+
+
+# --- EOS JSON parsing ------------------------------------------------------
+
+# Arista EOS route protocol strings from ``show ip route vrf all | json``.
+# EOS breaks OSPF and IS-IS into sub-protocols by LSA class; we collapse them
+# back to the parent protocol for cross-vendor comparability. Unknown strings
+# raise ValueError so EOS version drift surfaces loudly (same policy as FRR).
+_EOS_PROTOCOL_MAP: dict[str, Protocol] = {
+    "bgp": "bgp",
+    "ibgp": "bgp",
+    "ebgp": "bgp",
+    "ospf": "ospf",
+    "ospf intra area": "ospf",
+    "ospf inter area": "ospf",
+    "ospf external type 1": "ospf",
+    "ospf external type 2": "ospf",
+    "ospf nssa external type 1": "ospf",
+    "ospf nssa external type 2": "ospf",
+    "ospfintraarea": "ospf",
+    "ospfinterarea": "ospf",
+    "ospfexternal": "ospf",
+    "isis": "isis",
+    "isis level-1": "isis",
+    "isis level-2": "isis",
+    "static": "static",
+    "connected": "connected",
+    "direct": "connected",  # EOS labels interface /32s "direct" in some versions
+    "local": "local",
+    "rip": "rip",
+}
+_EOS_PROTOCOL_SKIP: frozenset[str] = frozenset(
+    {
+        # Management / kernel / internal routes that never factor into the
+        # benchmark. Keep explicit so EOS version drift can't silently grow
+        # the set.
+        "attached host",
+        "attached-host",
+        "aggregate",
+        "dhcp",
+        "vxlan control service",
+    }
+)
+
+
+def parse_eos_route_json(
+    data: dict[str, Any],
+    *,
+    node_name: str,
+    source: Source = "vendor",
+) -> list[NodeFib]:
+    """Convert EOS's ``show ip route vrf all | json`` output to canonical NodeFibs.
+
+    EOS schema (multi-VRF native)::
+
+        {"vrfs": {"<vrf>": {"routes": {"<prefix>": {
+            "routeType": "ospfIntraArea",
+            "routeAction": "forward",
+            "kernelProgrammed": True,
+            "directlyConnected": False,
+            "preference": 110,
+            "metric": 20,
+            "vias": [{"interface": "Ethernet1", "nexthopAddr": "10.0.12.1"}],
+            "protocol": "ospf intra area",
+        }}}}}
+
+    Filters:
+    - ``routeAction`` must be ``forward`` (not ``drop``/``discard``).
+    - ``kernelProgrammed`` must be True (entry reached the FIB).
+
+    Routes with an empty ``vrfs`` block emit one empty ``default`` NodeFib so
+    the downstream pipeline always has a per-node file to write.
+    """
+    if not data or not isinstance(data, dict):
+        return [NodeFib(node=node_name, vrf="default", source=source, routes=[])]
+
+    vrfs = data.get("vrfs") if isinstance(data.get("vrfs"), dict) else None
+    if vrfs is None:
+        return [NodeFib(node=node_name, vrf="default", source=source, routes=[])]
+
+    results: list[NodeFib] = []
+    for vrf_name, vrf_body in vrfs.items():
+        if not isinstance(vrf_body, dict):
+            continue
+        routes: list[Route] = []
+        route_map = vrf_body.get("routes", {})
+        if not isinstance(route_map, dict):
+            route_map = {}
+        for prefix, entry in route_map.items():
+            if not isinstance(entry, dict):
+                continue
+            parsed = _parse_eos_route_entry(prefix, entry)
+            if parsed is not None:
+                routes.append(parsed)
+        results.append(
+            NodeFib(
+                node=node_name,
+                vrf=canonicalize_vrf(vrf_name),
+                source=source,
+                routes=routes,
+            )
+        )
+    # EOS can emit `{"vrfs": {}}` for a freshly-booted node. Keep the downstream
+    # invariant that every node has at least a default NodeFib written.
+    if not results:
+        results.append(NodeFib(node=node_name, vrf="default", source=source, routes=[]))
+    return results
+
+
+def _parse_eos_route_entry(prefix: str, entry: dict[str, Any]) -> Route | None:
+    """Convert one EOS route entry to a ``Route`` or return None to skip it."""
+    action = (entry.get("routeAction") or "forward").lower()
+    if action not in ("forward", "permit"):
+        return None
+    if entry.get("kernelProgrammed") is False:
+        return None
+    raw_proto = (entry.get("protocol") or "").lower().strip()
+    if not raw_proto:
+        # Some EOS versions put the label only in routeType.
+        raw_proto = _route_type_to_proto(entry.get("routeType") or "")
+    if raw_proto in _EOS_PROTOCOL_SKIP:
+        return None
+    protocol = _EOS_PROTOCOL_MAP.get(raw_proto)
+    if protocol is None:
+        raise ValueError(
+            f"unknown EOS protocol {raw_proto!r} for prefix {prefix!r}; "
+            "update _EOS_PROTOCOL_MAP or _EOS_PROTOCOL_SKIP"
+        )
+    nhs: list[NextHop] = []
+    for via in entry.get("vias", []):
+        if not isinstance(via, dict):
+            continue
+        ip = via.get("nexthopAddr") or via.get("nextHopAddr")
+        iface = via.get("interface")
+        if not ip and not iface:
+            continue
+        # EOS uses "0.0.0.0" for connected routes with no explicit next-hop;
+        # drop those to match FRR's representation (interface-only).
+        if ip == "0.0.0.0":
+            ip = None
+        nhs.append(NextHop(ip=ip, interface=iface))
+    return Route(
+        prefix=prefix,
+        protocol=protocol,
+        next_hops=nhs,
+        admin_distance=entry.get("preference"),
+        metric=entry.get("metric"),
+    )
+
+
+def _route_type_to_proto(route_type: str) -> str:
+    """Map EOS ``routeType`` camelCase tokens to the lowercased protocol label.
+
+    EOS routeType examples: ``ospfIntraArea``, ``ospfInterArea``, ``bgp``,
+    ``static``, ``connected``, ``isisLevel1``, ``isisLevel2``.
+    """
+    rt = route_type.strip()
+    if not rt:
+        return ""
+    mapping = {
+        "ospfIntraArea": "ospf intra area",
+        "ospfInterArea": "ospf inter area",
+        "ospfExternalType1": "ospf external type 1",
+        "ospfExternalType2": "ospf external type 2",
+        "ospfNssaExternalType1": "ospf nssa external type 1",
+        "ospfNssaExternalType2": "ospf nssa external type 2",
+        "isisLevel1": "isis level-1",
+        "isisLevel2": "isis level-2",
+        "bgpInternal": "ibgp",
+        "bgpExternal": "ebgp",
+    }
+    return mapping.get(rt, rt.lower())
 
 
 def merge_bgp_attributes(fib: NodeFib, bgp_json: dict[str, Any]) -> NodeFib:

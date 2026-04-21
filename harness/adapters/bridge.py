@@ -28,6 +28,7 @@ class BridgeAdapter(VendorAdapter):
 
     kind: str = "bridge"
     memory_mb: int = 0
+    config_template_names: tuple[str, ...] = ()
 
     def render_clab_node(self, name: str, config_path: Path) -> dict:
         """Clab YAML dict for a bridge node: just the kind field."""

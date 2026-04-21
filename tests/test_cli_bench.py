@@ -78,15 +78,22 @@ def test_max_nodes_filters_larger_topologies() -> None:
     assert "spine-leaf-6node" not in names
 
 
-def test_acl_semantics_gate_raises_when_enabled_in_phase_7() -> None:
-    # Phase 7 stub raises NotImplementedError at import. The gate is
-    # working iff flipping --with-acl-semantics=True surfaces that error.
-    import pytest  # noqa: PLC0415
+def test_acl_semantics_gate_loads_mixed_vendor_topology_when_enabled() -> None:
+    # Phase 8: the acl-semantics-3node SPEC is real (r1/r3 FRR + r2 cEOS).
+    # The gate is working iff --with-acl-semantics=True surfaces it in the
+    # select set and --with-acl-semantics=False hides it.
+    specs = _select_topologies(
+        only={"acl-semantics-3node"},
+        skip=set(),
+        with_acl_semantics=True,
+        max_nodes=None,
+    )
+    assert "acl-semantics-3node" in _names(specs)
 
-    with pytest.raises(NotImplementedError, match="phase-7 stub"):
-        _select_topologies(
-            only={"acl-semantics-3node"},
-            skip=set(),
-            with_acl_semantics=True,
-            max_nodes=None,
-        )
+    hidden = _select_topologies(
+        only=set(),
+        skip=set(),
+        with_acl_semantics=False,
+        max_nodes=None,
+    )
+    assert "acl-semantics-3node" not in _names(hidden)

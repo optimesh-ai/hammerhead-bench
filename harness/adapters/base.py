@@ -24,6 +24,19 @@ class VendorAdapter(Protocol):
     memory_mb: int
     """Per-container memory cap in MiB. The pipeline sums these to decide headroom."""
 
+    config_template_names: tuple[str, ...]
+    """Template filenames (with ``.j2`` suffix) this adapter expects the renderer
+    to emit under ``configs/<node>/``.
+
+    Exists so a mixed-vendor topology (FRR + cEOS in ``acl-semantics-3node``)
+    doesn't end up with every adapter's templates rendered into every node's
+    config dir. The renderer looks up each name via the Jinja ChoiceLoader
+    (topology template_dir first, then ``harness/_templates/shared/``).
+
+    FRR: ``("frr.conf.j2", "daemons.j2")``. cEOS: ``("startup-config.j2",)``.
+    Bridge: empty tuple (no configs rendered).
+    """
+
     def render_clab_node(self, name: str, config_path: Path) -> dict:
         """Return the dict that goes under ``topology.nodes[<name>]`` in the clab YAML.
 
@@ -54,6 +67,4 @@ class AdapterNotImplementedError(NotImplementedError):
     """Raised by stub adapters. Points callers at the TODO file for that vendor."""
 
     def __init__(self, vendor: str, todo_path: str):
-        super().__init__(
-            f"{vendor}: not implemented in v1. See {todo_path} for scope + plan."
-        )
+        super().__init__(f"{vendor}: not implemented in v1. See {todo_path} for scope + plan.")

@@ -6,6 +6,12 @@ topology:
 {%- if node.adapter.kind == "bridge" %}
     {{ node.name }}:
       kind: bridge
+{%- elif node.adapter.kind == "ceos" %}
+    {{ node.name }}:
+      kind: ceos
+      image: {{ node.adapter.image }}
+      memory: {{ node.adapter.memory_mb }}m
+      startup-config: configs/{{ node.name }}/startup-config
 {%- else %}
     {{ node.name }}:
       kind: linux

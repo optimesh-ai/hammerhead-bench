@@ -1,0 +1,44 @@
+! cEOS startup-config — {{ node.name }} ({{ spec.name }})
+!
+hostname {{ node.name }}
+!
+no aaa root
+!
+username admin privilege 15 role network-admin secret 0 admin
+!
+spanning-tree mode mstp
+!
+ip access-list {{ params.acl_name }}
+{%- for seq, action, proto, src, dst, l4 in params.acl_entries %}
+   {{ seq }} {{ action }} {{ proto }} {{ src }} {{ dst }}{% if l4 %} {{ l4 }}{% endif %}
+{%- endfor %}
+!
+interface Loopback0
+   ip address {{ params.loopback }}/32
+!
+{%- for iface in node.interfaces %}
+interface {{ iface.name }}
+{%- if iface.description %}
+   description {{ iface.description }}
+{%- endif %}
+   no switchport
+{%- if iface.ip %}
+   ip address {{ iface.ip }}
+{%- endif %}
+   ip ospf area {{ params.area }}
+   ip ospf network point-to-point
+{%- if params.acl_bound_interface and iface.name == params.acl_bound_interface %}
+   ip access-group {{ params.acl_name }} in
+{%- endif %}
+!
+{%- endfor %}
+!
+router ospf 1
+   router-id {{ params.loopback }}
+   network 0.0.0.0/0 area {{ params.area }}
+   passive-interface Loopback0
+!
+management api http-commands
+   no shutdown
+!
+end

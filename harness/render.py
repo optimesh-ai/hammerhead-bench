@@ -46,8 +46,8 @@ def render_topology(spec: TopologySpec, workdir: Path) -> Path:
     env = _build_env(spec)
     clab_path = _render_clab_yaml(spec, env, workdir)
     for node in spec.nodes:
-        if node.adapter.kind == "bridge":
-            continue  # bridge nodes have no per-node config templates
+        if not node.adapter.config_template_names:
+            continue  # bridges (and any future zero-config adapter) skip config rendering
         _render_node_configs(spec, node, env, workdir)
     return clab_path
 
@@ -72,21 +72,18 @@ def _render_clab_yaml(spec: TopologySpec, env: Environment, workdir: Path) -> Pa
 
 
 def _render_node_configs(spec: TopologySpec, node, env: Environment, workdir: Path) -> None:
+    """Render only the templates this node's adapter declares.
+
+    ``node.adapter.config_template_names`` is the allow-list: anything else
+    under ``spec.template_dir`` (or the shared dir) is either a different
+    vendor's template (mixed-vendor topology — e.g. FRR frr.conf.j2 on a
+    cEOS node) or the top-level clab YAML itself. Filtering here means
+    each node only gets its own vendor's config files.
+    """
     node_dir = workdir / "configs" / node.name
     node_dir.mkdir(parents=True, exist_ok=True)
-    seen: set[str] = set()
-    for tmpl_path in _node_template_paths(spec):
-        if tmpl_path.name == _TOPO_YAML_TEMPLATE or tmpl_path.name in seen:
-            continue
-        seen.add(tmpl_path.name)
-        tmpl = env.get_template(tmpl_path.name)
+    for tmpl_name in node.adapter.config_template_names:
+        tmpl = env.get_template(tmpl_name)
         out = tmpl.render(spec=spec, node=node, params=node.params)
-        filename = tmpl_path.name[: -len(".j2")]
+        filename = tmpl_name[: -len(".j2")] if tmpl_name.endswith(".j2") else tmpl_name
         (node_dir / filename).write_text(out)
-
-
-def _node_template_paths(spec: TopologySpec):
-    """Yield every ``*.j2`` in topology + shared dirs, topology first."""
-    yield from spec.template_dir.glob("*.j2")
-    if _SHARED_TEMPLATE_DIR.is_dir():
-        yield from _SHARED_TEMPLATE_DIR.glob("*.j2")

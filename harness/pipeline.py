@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from harness.adapters.bridge import BridgeAdapter
+from harness.adapters.ceos import CeosAdapter
 from harness.adapters.frr import FrrAdapter
 from harness.clab import ClabDriver, ClabError, DeployedLab, RealClab
 from harness.diff.engine import DiffRecord, diff_fibs, load_fib_workspace
@@ -242,9 +243,7 @@ def _sum_container_caps(spec: TopologySpec) -> int:
     return sum(n.adapter.memory_mb for n in spec.nodes)
 
 
-def _record_sample(
-    result: TopologyRunResult, sample: MemorySample, mem_path: Path
-) -> None:
+def _record_sample(result: TopologyRunResult, sample: MemorySample, mem_path: Path) -> None:
     """Append to in-memory result + disk jsonl in one place so they can't drift."""
     result.memory_samples.append(sample)
     append_memory_sample(mem_path, sample)
@@ -295,7 +294,7 @@ def _wait_convergence(spec: TopologySpec, lab: DeployedLab) -> None:
         if isinstance(node.adapter, BridgeAdapter):
             continue  # bridges are L2 plumbing, no convergence concept
         container = lab.container_name(node.name)
-        if isinstance(node.adapter, FrrAdapter):
+        if isinstance(node.adapter, FrrAdapter | CeosAdapter):
             if not node.adapter.wait_for_convergence(container):
                 raise TimeoutError(f"{node.name}: did not converge within hard cap")
         else:
@@ -312,7 +311,7 @@ def _extract_vendor_fibs(spec: TopologySpec, lab: DeployedLab) -> list[NodeFib]:
         if isinstance(node.adapter, BridgeAdapter):
             continue  # bridges are L2 plumbing; no FIB to extract
         container = lab.container_name(node.name)
-        if isinstance(node.adapter, FrrAdapter):
+        if isinstance(node.adapter, FrrAdapter | CeosAdapter):
             raw = node.adapter.extract_fib(container, node_name=node.name)
             fibs.extend(canonicalize_node_fib(f) for f in raw)
         else:
