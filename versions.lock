@@ -1,0 +1,37 @@
+# Pinned container images for hammerhead-bench.
+#
+# Upgrading a pin: edit the line below. The Makefile reads this file via shell-out
+# so the diff is one line and visible in code review. DO NOT pin in multiple places.
+#
+# -- FRR --
+# Pinned by tag because the frrouting project does not re-push patch tags.
+# Tags on Docker Hub carry a leading `v`. Verify with:
+#   docker manifest inspect frrouting/frr:v8.4.1
+#
+# Note: the `frrouting/frr` Docker Hub repo was frozen at v8.4.1 in Dec 2022
+# — upstream FRR moved to source builds and no longer publishes there. v8.4.1
+# is also the version Hammerhead's ground-truth harness validated against,
+# which is convenient (same FRR means the two harnesses measure the same
+# semantics). For newer FRR, users build locally from
+# https://github.com/FRRouting/frr and override FRR_IMAGE.
+FRR_IMAGE=frrouting/frr:v8.4.1
+
+# -- Batfish --
+# Pinned by digest because Docker Hub allows tags to be re-pushed and the
+# batfish/allinone:latest tag is moved weekly. A benchmark that claims "Batfish
+# v2024.05.01" is meaningless if the underlying image drifted.
+#
+# Populate this on a fresh machine with:
+#
+#   docker pull batfish/allinone:latest
+#   docker image inspect batfish/allinone:latest \
+#       --format '{{index .RepoDigests 0}}'
+#
+# ... then paste the sha256 here. preflight.py warns if the placeholder is still set.
+BATFISH_IMAGE=batfish/allinone@sha256:PIN_AFTER_FIRST_PULL
+
+# -- Arista cEOS-lab --
+# cEOS images are not on Docker Hub (Arista requires a free EOS Central account).
+# The user imports the tarball with `docker import cEOS-lab-<ver>.tar ceos:<ver>`.
+# Expected tag documented here; tested against 4.32.0F.
+CEOS_IMAGE=ceos:4.32.0F

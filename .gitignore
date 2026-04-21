@@ -1,0 +1,31 @@
+# Runtime outputs — all regenerable.
+results/*
+!results/.gitkeep
+snapshots/
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# uv
+.venv/
+uv.lock
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# containerlab runtime artifacts that sometimes spill out of /tmp
+*.clab.yml.bak
+clab-*/

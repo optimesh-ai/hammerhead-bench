@@ -1,0 +1,13 @@
+{# Shared Jinja2 macros for topology configs.
+
+   Populated alongside the first real topology in phase 2. Examples of macros
+   that will live here:
+
+     - interface_block(name, ipv4, description="")
+     - bgp_neighbor(peer_ip, remote_as, loopback_source=None)
+     - ospf_interface(name, area=0, network="point-to-point")
+     - apply_route_map(name, direction, neighbor)
+
+   Anything repeated across two or more topologies should land here; keep
+   topology-local logic inside its own templates.
+#}
