@@ -1,0 +1,57 @@
+frr defaults traditional
+hostname {{ node.name }}
+no ipv6 forwarding
+!
+interface lo
+ ip address {{ params.loopback }}/32
+!
+{% for iface in node.interfaces %}
+interface {{ iface.name }}
+{%- if iface.description %}
+ description {{ iface.description }}
+{%- endif %}
+{%- if iface.ip %}
+ ip address {{ iface.ip }}
+{%- endif %}
+!
+{% endfor %}
+{% for pr in params.peer_routes -%}
+ip route {{ pr.loopback }}/32 {{ pr.segment_ip }}
+{% endfor -%}
+!
+router bgp {{ params.asn }}
+ bgp router-id {{ params.loopback }}
+ no bgp ebgp-requires-policy
+ bgp log-neighbor-changes
+{% if params.role == "rr" %}
+ bgp cluster-id {{ params.cluster_id }}
+{% for peer in params.client_peers %}
+ neighbor {{ peer }} remote-as {{ params.asn }}
+ neighbor {{ peer }} update-source lo
+{%- endfor %}
+ neighbor {{ params.rr_peer }} remote-as {{ params.asn }}
+ neighbor {{ params.rr_peer }} update-source lo
+{% else %}
+{% for peer in params.rr_peers %}
+ neighbor {{ peer }} remote-as {{ params.asn }}
+ neighbor {{ peer }} update-source lo
+{%- endfor %}
+{% endif %}
+ !
+ address-family ipv4 unicast
+{% if params.role == "rr" %}
+{% for peer in params.client_peers %}
+  neighbor {{ peer }} activate
+  neighbor {{ peer }} route-reflector-client
+{%- endfor %}
+  neighbor {{ params.rr_peer }} activate
+{% else %}
+  network {{ params.loopback }}/32
+{% for peer in params.rr_peers %}
+  neighbor {{ peer }} activate
+{%- endfor %}
+{% endif %}
+ exit-address-family
+!
+line vty
+!

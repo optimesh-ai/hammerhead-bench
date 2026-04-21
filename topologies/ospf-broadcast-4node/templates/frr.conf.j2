@@ -1,0 +1,27 @@
+frr defaults traditional
+hostname {{ node.name }}
+no ipv6 forwarding
+!
+interface lo
+ ip address {{ params.loopback }}/32
+ ip ospf area {{ params.area }}
+!
+{% for iface in node.interfaces %}
+interface {{ iface.name }}
+{%- if iface.description %}
+ description {{ iface.description }}
+{%- endif %}
+{%- if iface.ip %}
+ ip address {{ iface.ip }}
+{%- endif %}
+ ip ospf network broadcast
+ ip ospf priority {{ params.ospf_priority }}
+ ip ospf area {{ params.area }}
+!
+{% endfor %}
+router ospf
+ ospf router-id {{ params.loopback }}
+ passive-interface lo
+!
+line vty
+!

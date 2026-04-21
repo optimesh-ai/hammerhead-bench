@@ -1,0 +1,52 @@
+frr defaults traditional
+hostname {{ node.name }}
+no ipv6 forwarding
+!
+interface lo
+ ip address {{ params.loopback }}/32
+!
+{% for iface in node.interfaces %}
+interface {{ iface.name }}
+{%- if iface.description %}
+ description {{ iface.description }}
+{%- endif %}
+{%- if iface.ip %}
+ ip address {{ iface.ip }}
+{%- endif %}
+!
+{% endfor %}
+{% for peer in params.peers -%}
+ip route {{ peer.loopback }}/32 {{ peer.transit_ip }}
+{% endfor -%}
+!
+router bgp {{ params.asn }}
+ bgp router-id {{ params.loopback }}
+ no bgp ebgp-requires-policy
+ bgp log-neighbor-changes
+{% for peer in params.peers %}
+ neighbor {{ peer.loopback }} remote-as {{ params.asn }}
+ neighbor {{ peer.loopback }} update-source lo
+{%- endfor %}
+ !
+ address-family ipv4 unicast
+{%- if params.role == "origin" %}
+  network {{ params.originate_prefix }}
+{%- endif %}
+{% for peer in params.peers %}
+  neighbor {{ peer.loopback }} activate
+  neighbor {{ peer.loopback }} next-hop-self
+  neighbor {{ peer.loopback }} send-community
+{%- if params.role == "policy" and peer.loopback == params.policy_peer %}
+  neighbor {{ peer.loopback }} route-map {{ params.route_map }} in
+{%- endif %}
+{%- endfor %}
+ exit-address-family
+!
+{% if params.role == "policy" %}
+route-map {{ params.route_map }} permit 10
+ set local-preference {{ params.route_map_set_lp }}
+ set community {{ params.route_map_set_community }} additive
+!
+{% endif %}
+line vty
+!

@@ -2,19 +2,28 @@
 
 Phase 3 scope: render → headroom-check → deploy → converge → extract(vendor)
  → destroy → recovery-verify → teardown-verify. Writes one ``MemorySample`` per
-phase to ``results/memory.jsonl``. Batfish + Hammerhead slots are still TODO
-markers; they hook in at phase 5/6 without changing this file's public contract.
+phase to ``results/memory.jsonl``.
+
+Phase 7 extends that scope by running Batfish + Hammerhead on the rendered
+configs (out-of-band, not against live containers) and computing the
+vendor-vs-simulator diffs. All three simulator hooks are injectable via
+``BenchHooks`` so unit tests can swap in fakes and drive the happy path
+without Docker, pybatfish, or a Rust binary on the host.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from harness.adapters.bridge import BridgeAdapter
 from harness.adapters.frr import FrrAdapter
 from harness.clab import ClabDriver, ClabError, DeployedLab, RealClab
+from harness.diff.engine import DiffRecord, diff_fibs, load_fib_workspace
+from harness.diff.metrics import TopologyMetrics, aggregate
 from harness.extract.fib import NodeFib, canonicalize_node_fib
 from harness.memory import (
     PHASE_POST_DEPLOY,
@@ -43,12 +52,43 @@ class TopologyRunResult:
     started_iso: str
     finished_iso: str
     vendor_truth_path: Path | None = None
+    batfish_path: Path | None = None
+    hammerhead_path: Path | None = None
+    diff_path: Path | None = None
+    metrics: TopologyMetrics | None = None
     error: str | None = None
     notes: list[str] = field(default_factory=list)
     memory_samples: list[MemorySample] = field(default_factory=list)
 
 
-def run_topology(
+# Injectable simulator hooks. Each takes (configs_dir, out_dir, topology)
+# and writes per-(node, vrf) JSON files into out_dir. Raising propagates
+# the failure into the per-topology result without leaking a partial diff.
+BatfishHook = Callable[[Path, Path, str], None]
+HammerheadHook = Callable[[Path, Path, str], None]
+
+
+@dataclass(slots=True)
+class BenchHooks:
+    """Injectable simulator hooks for Phase 7+.
+
+    ``batfish`` and ``hammerhead`` default to ``None`` so the Phase 3 code
+    path (vendor-only smoke) stays unchanged. When a hook is set, the
+    pipeline runs it against the rendered ``configs/`` directory and writes
+    per-(node, vrf) JSON under ``results/<sim>/<topology>/``.
+
+    ``filter_loopback_host`` threads straight to ``diff_fibs`` so the three
+    FIB sources are compared on the same footing (FRR emits /32 host routes
+    for its loopbacks; Batfish doesn't; Hammerhead's Rust side follows
+    Batfish's convention).
+    """
+
+    batfish: BatfishHook | None = None
+    hammerhead: HammerheadHook | None = None
+    filter_loopback_host: bool = True
+
+
+def run_topology(  # noqa: PLR0915 — phased pipeline; refactor scheduled for phase 10
     spec: TopologySpec,
     *,
     workdir: Path,
@@ -57,6 +97,7 @@ def run_topology(
     keep_lab_on_failure: bool = False,
     memory_log: Path | None = None,
     headroom_multiplier: float = 2.0,
+    hooks: BenchHooks | None = None,
 ) -> TopologyRunResult:
     """Run one topology end-to-end. Caller guarantees sequential invocation.
 
@@ -79,7 +120,11 @@ def run_topology(
     """
     started = _now_iso()
     vt_dir = results_dir / "vendor_truth" / spec.name
+    bf_dir = results_dir / "batfish" / spec.name
+    hh_dir = results_dir / "hammerhead" / spec.name
+    diff_dir = results_dir / "diff" / spec.name
     mem_path = memory_log if memory_log is not None else results_dir / "memory.jsonl"
+    hooks = hooks or BenchHooks()
     result = TopologyRunResult(
         topology=spec.name,
         status="failed",
@@ -130,9 +175,28 @@ def run_topology(
         _write_fibs(fibs, vt_dir)
         result.vendor_truth_path = vt_dir
 
-        # TODO(phase-5): pipeline Batfish here; write to results_dir/batfish/<topology>/.
-        # TODO(phase-6): pipeline Hammerhead here; write to results_dir/hammerhead/<topology>/.
-        # TODO(phase-4): diff(vendor, batfish) + diff(vendor, hammerhead).
+        configs_dir = workdir / "configs"
+        if hooks.batfish is not None:
+            log.info("[%s] running batfish", spec.name)
+            bf_dir.mkdir(parents=True, exist_ok=True)
+            hooks.batfish(configs_dir, bf_dir, spec.name)
+            result.batfish_path = bf_dir
+        if hooks.hammerhead is not None:
+            log.info("[%s] running hammerhead", spec.name)
+            hh_dir.mkdir(parents=True, exist_ok=True)
+            hooks.hammerhead(configs_dir, hh_dir, spec.name)
+            result.hammerhead_path = hh_dir
+
+        if hooks.batfish is not None or hooks.hammerhead is not None:
+            log.info("[%s] computing diff", spec.name)
+            metrics = _compute_diff(
+                spec=spec,
+                results_dir=results_dir,
+                diff_dir=diff_dir,
+                filter_loopback_host=hooks.filter_loopback_host,
+            )
+            result.metrics = metrics
+            result.diff_path = diff_dir
 
         result.status = "passed"
     except MemoryGuardError as exc:
@@ -228,6 +292,8 @@ def _verify_recovery(
 def _wait_convergence(spec: TopologySpec, lab: DeployedLab) -> None:
     """Per spec: wait on every node, bail the whole topology if any node times out."""
     for node in spec.nodes:
+        if isinstance(node.adapter, BridgeAdapter):
+            continue  # bridges are L2 plumbing, no convergence concept
         container = lab.container_name(node.name)
         if isinstance(node.adapter, FrrAdapter):
             if not node.adapter.wait_for_convergence(container):
@@ -243,6 +309,8 @@ def _extract_vendor_fibs(spec: TopologySpec, lab: DeployedLab) -> list[NodeFib]:
     """Pull + canonicalize the FIB from every node. Returns one NodeFib per (node, vrf)."""
     fibs: list[NodeFib] = []
     for node in spec.nodes:
+        if isinstance(node.adapter, BridgeAdapter):
+            continue  # bridges are L2 plumbing; no FIB to extract
         container = lab.container_name(node.name)
         if isinstance(node.adapter, FrrAdapter):
             raw = node.adapter.extract_fib(container, node_name=node.name)
@@ -275,3 +343,34 @@ def _verify_teardown(driver: ClabDriver, result: TopologyRunResult) -> None:
 
 def _now_iso() -> str:
     return datetime.now(tz=UTC).isoformat(timespec="seconds")
+
+
+def _compute_diff(
+    *,
+    spec: TopologySpec,
+    results_dir: Path,
+    diff_dir: Path,
+    filter_loopback_host: bool,
+) -> TopologyMetrics:
+    """Load the three FIB sources, diff them, persist records + metrics."""
+    workspace = load_fib_workspace(results_dir, spec.name)
+    records = diff_fibs(workspace, filter_loopback_host=filter_loopback_host)
+    metrics = aggregate(spec.name, records)
+
+    diff_dir.mkdir(parents=True, exist_ok=True)
+    _write_diff_records(records, diff_dir / "records.json")
+    _write_metrics(metrics, diff_dir / "metrics.json")
+    return metrics
+
+
+def _write_diff_records(records: list[DiffRecord], path: Path) -> None:
+    import json  # noqa: PLC0415 — lazy import; non-diff runs don't need json here.
+
+    payload = [r.as_dict() for r in records]
+    path.write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def _write_metrics(metrics: TopologyMetrics, path: Path) -> None:
+    import json  # noqa: PLC0415
+
+    path.write_text(json.dumps(metrics.as_dict(), indent=2) + "\n")

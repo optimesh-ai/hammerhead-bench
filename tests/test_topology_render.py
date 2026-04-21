@@ -82,3 +82,28 @@ def test_render_is_idempotent(tmp_path: Path) -> None:
     render_topology(spec, tmp_path)
     after = (tmp_path / "configs" / "r1" / "frr.conf").read_text()
     assert before == after
+
+
+# ----- bridge handling (phase 7: ospf-broadcast-4node, route-reflector-6node) --
+
+BRIDGE_TOPO_DIR = Path(__file__).resolve().parent.parent / "topologies" / "ospf-broadcast-4node"
+
+
+def test_bridge_node_renders_as_clab_bridge_kind(tmp_path: Path) -> None:
+    spec = load_spec(BRIDGE_TOPO_DIR)
+    clab_yaml = render_topology(spec, tmp_path)
+    content = clab_yaml.read_text()
+
+    # hub is a clab bridge kind — no image, no memory, no binds.
+    assert "hub:" in content
+    assert "kind: bridge" in content
+
+
+def test_bridge_node_gets_no_config_directory(tmp_path: Path) -> None:
+    spec = load_spec(BRIDGE_TOPO_DIR)
+    render_topology(spec, tmp_path)
+
+    # FRR routers get configs/<name>/{frr.conf, daemons}; hub gets nothing.
+    for router in ("r1", "r2", "r3", "r4"):
+        assert (tmp_path / "configs" / router / "frr.conf").exists()
+    assert not (tmp_path / "configs" / "hub").exists()

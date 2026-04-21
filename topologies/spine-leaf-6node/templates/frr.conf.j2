@@ -1,0 +1,47 @@
+frr defaults traditional
+hostname {{ node.name }}
+no ipv6 forwarding
+!
+interface lo
+ ip address {{ params.loopback }}/32
+!
+{% for iface in node.interfaces %}
+interface {{ iface.name }}
+{%- if iface.description %}
+ description {{ iface.description }}
+{%- endif %}
+{%- if iface.ip %}
+ ip address {{ iface.ip }}
+{%- endif %}
+!
+{% endfor %}
+router bgp {{ params.asn }}
+ bgp router-id {{ params.loopback }}
+ no bgp ebgp-requires-policy
+ bgp log-neighbor-changes
+{% if params.role == "leaf" %}
+{% for peer in params.spine_peers %}
+ neighbor {{ peer.ip }} remote-as {{ peer.asn }}
+{%- endfor %}
+{% else %}
+{% for peer in params.leaf_peers %}
+ neighbor {{ peer.ip }} remote-as {{ peer.asn }}
+{%- endfor %}
+{% endif %}
+ !
+ address-family ipv4 unicast
+  maximum-paths 2
+{% if params.role == "leaf" %}
+  network {{ params.loopback }}/32
+{% for peer in params.spine_peers %}
+  neighbor {{ peer.ip }} activate
+{%- endfor %}
+{% else %}
+{% for peer in params.leaf_peers %}
+  neighbor {{ peer.ip }} activate
+{%- endfor %}
+{% endif %}
+ exit-address-family
+!
+line vty
+!

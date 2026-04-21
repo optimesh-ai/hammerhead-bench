@@ -9,20 +9,30 @@ The output layout under ``<workdir>`` is:
                 frr.conf        # vendor config (FRR only in phase 2)
                 daemons         # FRR daemons toggle file
 
-Any adapter that needs per-node rendering can add another template name; the
-``render_node_configs`` function glob-renders every ``*.j2`` in the topology's
-template_dir minus the top-level ``topology.clab.yml.j2``.
+Jinja2 loader order:
+
+1. The topology-specific ``template_dir`` (highest precedence). A topology
+   that ships its own ``topology.clab.yml.j2`` or ``daemons.j2`` fully
+   overrides the shared copy.
+2. ``harness/_templates/shared/`` — shared ``topology.clab.yml.j2`` +
+   ``daemons.j2``. Lets the 9 Phase-7 topologies keep only their
+   vendor-specific ``frr.conf.j2`` in their own template dir.
+
+The rendered filename is the template name minus one trailing ``.j2``. Any
+``*.j2`` found in either loader path (minus the top-level clab YAML) is
+rendered once per node.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from jinja2 import Environment, FileSystemLoader, StrictUndefined
+from jinja2 import ChoiceLoader, Environment, FileSystemLoader, StrictUndefined
 
 from harness.topology import TopologySpec
 
 _TOPO_YAML_TEMPLATE = "topology.clab.yml.j2"
+_SHARED_TEMPLATE_DIR = Path(__file__).resolve().parent / "_templates" / "shared"
 
 
 def render_topology(spec: TopologySpec, workdir: Path) -> Path:
@@ -33,15 +43,24 @@ def render_topology(spec: TopologySpec, workdir: Path) -> Path:
     rendered files so reruns are idempotent.
     """
     workdir.mkdir(parents=True, exist_ok=True)
-    env = Environment(
-        loader=FileSystemLoader(str(spec.template_dir)),
+    env = _build_env(spec)
+    clab_path = _render_clab_yaml(spec, env, workdir)
+    for node in spec.nodes:
+        if node.adapter.kind == "bridge":
+            continue  # bridge nodes have no per-node config templates
+        _render_node_configs(spec, node, env, workdir)
+    return clab_path
+
+
+def _build_env(spec: TopologySpec) -> Environment:
+    loaders = [FileSystemLoader(str(spec.template_dir))]
+    if _SHARED_TEMPLATE_DIR.is_dir():
+        loaders.append(FileSystemLoader(str(_SHARED_TEMPLATE_DIR)))
+    return Environment(
+        loader=ChoiceLoader(loaders),
         undefined=StrictUndefined,
         keep_trailing_newline=True,
     )
-    clab_path = _render_clab_yaml(spec, env, workdir)
-    for node in spec.nodes:
-        _render_node_configs(spec, node, env, workdir)
-    return clab_path
 
 
 def _render_clab_yaml(spec: TopologySpec, env: Environment, workdir: Path) -> Path:
@@ -55,11 +74,19 @@ def _render_clab_yaml(spec: TopologySpec, env: Environment, workdir: Path) -> Pa
 def _render_node_configs(spec: TopologySpec, node, env: Environment, workdir: Path) -> None:
     node_dir = workdir / "configs" / node.name
     node_dir.mkdir(parents=True, exist_ok=True)
-    for tmpl_path in spec.template_dir.glob("*.j2"):
-        if tmpl_path.name == _TOPO_YAML_TEMPLATE:
+    seen: set[str] = set()
+    for tmpl_path in _node_template_paths(spec):
+        if tmpl_path.name == _TOPO_YAML_TEMPLATE or tmpl_path.name in seen:
             continue
+        seen.add(tmpl_path.name)
         tmpl = env.get_template(tmpl_path.name)
         out = tmpl.render(spec=spec, node=node, params=node.params)
-        # Strip one trailing .j2 to get the real filename.
         filename = tmpl_path.name[: -len(".j2")]
         (node_dir / filename).write_text(out)
+
+
+def _node_template_paths(spec: TopologySpec):
+    """Yield every ``*.j2`` in topology + shared dirs, topology first."""
+    yield from spec.template_dir.glob("*.j2")
+    if _SHARED_TEMPLATE_DIR.is_dir():
+        yield from _SHARED_TEMPLATE_DIR.glob("*.j2")

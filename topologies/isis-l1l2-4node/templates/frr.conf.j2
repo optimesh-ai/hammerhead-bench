@@ -1,0 +1,29 @@
+frr defaults traditional
+hostname {{ node.name }}
+no ipv6 forwarding
+!
+interface lo
+ ip address {{ params.loopback }}/32
+ ip router isis CORE
+ isis passive
+!
+{% for iface in node.interfaces %}
+interface {{ iface.name }}
+{%- if iface.description %}
+ description {{ iface.description }}
+{%- endif %}
+{%- if iface.ip %}
+ ip address {{ iface.ip }}
+{%- endif %}
+ ip router isis CORE
+ isis network point-to-point
+!
+{% endfor %}
+router isis CORE
+ net {{ params.net }}
+ is-type {{ params.is_type }}
+ metric-style wide
+ log-adjacency-changes
+!
+line vty
+!
