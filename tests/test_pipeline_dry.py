@@ -149,3 +149,55 @@ def test_run_topology_keep_lab_on_failure_skips_destroy(tmp_path: Path, monkeypa
     )
     assert result.status == "failed"
     assert clab.destroyed_paths == []
+
+
+def test_run_topology_writes_memory_jsonl(tmp_path: Path, patched_adapter) -> None:  # noqa: ARG001
+    spec = load_spec(TOPO_DIR)
+    clab = FakeClab()
+    result = run_topology(
+        spec,
+        workdir=tmp_path / "workdir",
+        results_dir=tmp_path / "results",
+        clab=clab,
+    )
+    assert result.status == "passed", result.error
+
+    mem_path = tmp_path / "results" / "memory.jsonl"
+    assert mem_path.exists()
+    rows = [json.loads(line) for line in mem_path.read_text().splitlines()]
+    # pre-deploy, post-deploy, post-teardown, recovered — 4 rows for a happy run.
+    phases = [r["phase"] for r in rows]
+    assert "pre-deploy" in phases
+    assert "post-deploy" in phases
+    assert "post-teardown" in phases
+    assert "recovered" in phases
+    # In-memory samples match disk.
+    assert [s.phase for s in result.memory_samples] == phases
+
+
+def test_run_topology_headroom_failure_aborts_before_deploy(
+    tmp_path: Path, monkeypatch, patched_adapter  # noqa: ARG001
+) -> None:
+    # Force ``available_mb`` so headroom fails: FRR defaults to 256MB x 2 nodes = 512MB;
+    # 2x multiplier needs 1024MB; reporting only 100MB trips the guard.
+    from harness import memory as memmod  # noqa: PLC0415
+
+    monkeypatch.setattr(memmod, "_available_mb", lambda: 100)
+
+    spec = load_spec(TOPO_DIR)
+    clab = FakeClab()
+    result = run_topology(
+        spec,
+        workdir=tmp_path / "workdir",
+        results_dir=tmp_path / "results",
+        clab=clab,
+    )
+    assert result.status == "failed"
+    assert "MemoryGuardError" in (result.error or "")
+    assert "insufficient host RAM" in (result.error or "")
+    # Never deployed.
+    assert clab.deployed_paths == []
+    # pre-deploy sample still made it to jsonl (audit trail).
+    mem = (tmp_path / "results" / "memory.jsonl").read_text().splitlines()
+    assert len(mem) == 1
+    assert json.loads(mem[0])["phase"] == "pre-deploy"
