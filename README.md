@@ -13,7 +13,8 @@ docker pull batfish/allinone                  # then pin its digest in versions.
 make preflight                                # sanity check
 make smoke                                    # one topology end-to-end (~5 min)
 make bench                                    # full corpus (~1 hour FRR-only)
-open results/report.html
+uv run hammerhead-bench report                # regenerate HTML + MD from results/
+open results/report/report.html
 ```
 
 ## What it measures
@@ -29,7 +30,7 @@ For each topology the harness runs sequentially:
 7. Runs Hammerhead via `$HAMMERHEAD_CLI` on the same configs; extracts its FIB.
 8. Diffs each tool's output against vendor truth.
 
-After all topologies: aggregated HTML + Markdown report with per-topology breakdown, per-protocol match rate, BGP attribute match rate, parse coverage, hardware disclosure, and a `results/raw.json` dump.
+After all topologies: `hammerhead-bench report` emits an HTML + Markdown summary under `results/report/` with a headline Batfish-vs-Hammerhead table, three Plotly charts (per-topology next-hop, per-protocol, per-topology presence), a per-topology breakdown, BGP attribute match rates, a failed-topology list, and methodology + hardware disclosures. Every dynamic value is HTML-escaped. Plotly is inlined once; the HTML file opens cleanly from a `file://` URL with no network fetch.
 
 ## Design principles
 
@@ -61,12 +62,45 @@ After all topologies: aggregated HTML + Markdown report with per-topology breakd
 | `mpls-l3vpn-4node` | 4 | PE–P–P–PE, one VRF, RT import/export |
 | `route-map-pathological` | 3 | BGP best-path tiebreakers via LOCAL_PREF rewrite |
 | `acl-heavy-parse` | 3 | 500-line overlapping ACL; measures parse coverage |
+| `acl-semantics-3node` | 3 | mixed-vendor (FRR + cEOS) first-match-wins ACL semantics |
 
-See `topologies/<name>/README.md` for each topology's pass criteria. The `acl-semantics-3node` topology (flow-level ACL audit) ships behind a `--with-acl-semantics` flag in phase 2.
+See `topologies/<name>/README.md` for each topology's pass criteria. The `acl-semantics-3node` topology (flow-level ACL audit on Arista cEOS) is gated behind `hammerhead-bench bench --with-acl-semantics` so FRR-only runs on FRR-only hosts stay green.
 
-## Development order
+## Pipeline
 
-Phase 1 (scaffold + preflight) is landed. Remaining phases are listed in `docs/PHASES.md` and tracked per commit. Stubbed modules raise clear errors pointing at the phase that implements them.
+Sequential per topology, driven by `harness.pipeline.run_topology`:
+
+1. **Render** — Jinja2 templates under `topologies/<name>/` + `shared_templates/` per adapter `kind` (linux / bridge / ceos), with `StrictUndefined`.
+2. **Deploy** — containerlab brings the lab up with per-container memory caps.
+3. **Converge** — wait for BGP Established + FIB stable across two 15 s intervals.
+4. **Extract vendor truth** — FRR via `vtysh`, cEOS via `Cli -c "<cmd> | json"`, normalized to a shared FIB schema.
+5. **Teardown + memory guard** — destroy the lab, verify zero dangling containers and memory recovery within 500 MB of baseline.
+6. **Batfish** — `batfish/allinone` container (`-Xmx4g`), pybatfish against the same config dir, FIB extracted to the same shape.
+7. **Hammerhead** — `$HAMMERHEAD_CLI simulate --format json`, transformed to the shared FIB shape.
+8. **Diff** — per (node, vrf, prefix) presence + next-hop + protocol + BGP-attribute rows (`harness.diff.engine`), metrics rolled up per topology (`harness.diff.metrics`).
+9. **Aggregate + report** — `hammerhead-bench report` loads all per-topology JSON and emits Markdown + HTML with charts.
+
+## CLI
+
+```
+hammerhead-bench preflight                                 # host sanity check
+hammerhead-bench smoke --topology bgp-ibgp-2node           # one topology end-to-end
+hammerhead-bench bench [--only NAME] [--skip NAME]         # full corpus
+               [--max-nodes N] [--with-acl-semantics]
+               [--no-batfish] [--no-hammerhead]
+               [--keep-lab-on-failure] [-v]
+hammerhead-bench report --results-dir results/             # regenerate HTML + MD
+```
+
+## Tests
+
+```bash
+uv sync --all-extras --dev
+uv run pytest                                              # 194 passed, 1 skipped
+uv run ruff check .
+```
+
+The suite covers template rendering, adapter dispatch, memory guards, diff engine, metrics, Batfish + Hammerhead wrappers, CLI selection, pipeline orchestration, and the full report generator (loader + 3 plot factories + HTML + Markdown). The one skipped test runs only when Docker + containerlab are present on the host.
 
 ## License
 
