@@ -18,6 +18,9 @@ interface {{ iface.name }}
 {% for peer in params.peers -%}
 ip route {{ peer.loopback }}/32 {{ peer.transit_ip }}
 {% endfor -%}
+{%- if params.role == "origin" and params.originate_prefix %}
+ip route {{ params.originate_prefix }} Null0
+{%- endif %}
 !
 router bgp {{ params.asn }}
  bgp router-id {{ params.loopback }}
