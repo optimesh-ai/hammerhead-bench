@@ -217,6 +217,22 @@ def test_agreement_exposes_fair_solve_plus_materialize_ratio(tmp_path: Path) -> 
     assert d["solve_ratio"] == pytest.approx(0.90 / 0.02)
     assert "hammerhead_rib_total_s" in d
     assert "hammerhead_simulate_plus_rib_s" in d
+    # Canonical keys (README § 1 / § 2): fair_ratio and asym_ratio with
+    # the in-band caveat. Legacy keys retained as aliases so pre-rename
+    # consumers don't break.
+    assert d["fair_ratio"] == pytest.approx(0.90 / 0.20)
+    assert d["asym_ratio"] == pytest.approx(0.90 / 0.02)
+    assert d["asym_ratio_note"] == (
+        "Hammerhead-favoring lower bound; see README §2. "
+        "Do not cite as headline."
+    )
+    # ``wall_ratio`` tracks Batfish wall / Hammerhead wall end-to-end.
+    # _CountingHook sets total_s ≈ simulate_s + rib_total_s + 0.001, so
+    # the two wall values are dominated by the per-side sidecar scalars.
+    assert d["wall_ratio"] is not None
+    assert d["wall_ratio"] > 1.0
+    # Node count stamped from ``len(spec.nodes)`` (bgp-ibgp-2node → 2).
+    assert d["nodes"] == 2
 
 
 def test_solve_plus_materialize_ratio_returns_none_without_rib_stat() -> None:

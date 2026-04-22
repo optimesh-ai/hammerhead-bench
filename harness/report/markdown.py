@@ -202,17 +202,28 @@ def _sim_only_per_topology_table(topologies: list[TopologyRow]) -> list[str]:
 
     Reads the ``agreement`` dict directly from each run — the with-truth
     ``metrics`` field is always ``None`` in sim-only mode. When trials > 1,
-    the wall-clock columns render as ``mean ± std`` using the per-topology
-    ``agreement.trial_stats`` payload.
+    every wall-clock column renders as ``mean ± std`` using the
+    per-topology ``agreement.trial_stats`` payload.
 
-    Columns:
+    Columns (README § 1 canonical order):
 
-    - ``presence`` — ``|B ∩ H| / |B ∪ H|`` (Jaccard; ``agreement.presence``
-      in the JSON, README § 2 carries the formal definition).
-    - ``B solve (s)`` — ``agreement.batfish_simulate_s`` (inner
-      pybatfish solve time, excluding JVM startup + upload).
-    - ``solve ratio`` — ``batfish_simulate_s / hammerhead_simulate_s``,
-      the apples-to-apples solver-only speedup.
+    - ``Nodes`` — ``agreement.nodes`` (``len(spec.nodes)``).
+    - ``Routes (bf / hh)`` — ``batfish_routes`` / ``hammerhead_routes``.
+    - ``Presence`` — ``|B ∩ H| / |B ∪ H|`` (Jaccard).
+    - ``NH agree`` — ``next_hop_agreement``.
+    - ``BF wall`` — ``batfish_wall_s`` (JVM start + upload + solve).
+    - ``HH wall`` — ``hammerhead_wall_s`` (simulate + rib + JSON + write).
+    - ``Wall ratio`` — ``batfish_wall_s / hammerhead_wall_s`` (conservative
+      upper bound; JVM-dominated at small scale).
+    - ``Fair ratio`` — ``batfish_simulate_s / (hammerhead_simulate_s +
+      hammerhead_rib_total_s)`` (apples-to-apples; the one we recommend
+      citing, formal definition in README § 2).
+
+    The legacy "solve ratio" column is deliberately dropped: it paired
+    Batfish's solve-plus-materialize against Hammerhead's solve-only and
+    so structurally flattered Hammerhead. The asymmetric ratio is still
+    in the JSON under ``agreement.asym_ratio`` with an in-band
+    ``asym_ratio_note`` caveat, but it does not surface here.
     """
     lines = ["## Per-topology"]
     if not topologies:
@@ -221,13 +232,12 @@ def _sim_only_per_topology_table(topologies: list[TopologyRow]) -> list[str]:
         return lines
     lines.append("")
     lines.append(
-        "| Topology | Status | B routes | H routes | "
-        "`|∩|` | `|∪|` | presence | "
-        "next-hop | proto | BGP attr | "
-        "B wall (s) | B solve (s) | H wall (s) | solve ratio |"
+        "| Topology | Status | Nodes | Routes (bf / hh) | "
+        "Presence | NH agree | BF wall (s) | HH wall (s) | "
+        "Wall ratio | Fair ratio |"
     )
     lines.append(
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"
     )
     for row in topologies:
         status = row.run.get("status", "?")
@@ -235,49 +245,60 @@ def _sim_only_per_topology_table(topologies: list[TopologyRow]) -> list[str]:
         if not agreement:
             lines.append(
                 f"| {row.topology} | {status} | "
-                "- | - | - | - | - | - | - | - | - | - | - | - |"
+                "- | - | - | - | - | - | - | - |"
             )
             continue
         trial_stats = agreement.get("trial_stats") or {}
-        bf_cell = _fmt_wall_with_std(
+        bf_wall_cell = _fmt_wall_with_std(
             agreement.get("batfish_wall_s"),
             trial_stats.get("batfish_wall_s"),
         )
-        hh_cell = _fmt_wall_with_std(
+        hh_wall_cell = _fmt_wall_with_std(
             agreement.get("hammerhead_wall_s"),
             trial_stats.get("hammerhead_wall_s"),
         )
-        bf_solve = _fmt_wall_with_std(
-            agreement.get("batfish_simulate_s"),
-            trial_stats.get("batfish_simulate_s"),
-        )
         presence_val = agreement.get("presence")
         if presence_val is None:
-            # pre-presence JSON → compute on the fly from the Jaccard inputs
             presence_val = agreement.get("coverage")
-        ratio = agreement.get("solve_ratio")
-        if ratio is None:
-            # back-fill from simulate_s fields (pre-solve_ratio JSONs)
-            bf_s = agreement.get("batfish_simulate_s")
-            hh_s = agreement.get("hammerhead_simulate_s")
-            if bf_s is not None and hh_s is not None and hh_s > 0:
-                ratio = bf_s / hh_s
-        ratio_cell = _fmt_solve_ratio(ratio)
+        wall_ratio = agreement.get("wall_ratio")
+        if wall_ratio is None:
+            bw = agreement.get("batfish_wall_s")
+            hw = agreement.get("hammerhead_wall_s")
+            if bw is not None and hw is not None and hw > 0:
+                wall_ratio = bw / hw
+        fair_ratio = agreement.get("fair_ratio")
+        if fair_ratio is None:
+            fair_ratio = agreement.get("solve_plus_materialize_ratio")
+        if fair_ratio is None:
+            # Last-resort back-fill for legacy sidecars that only carry
+            # simulate_s (no rib_total_s) — equivalent to the old asym
+            # ratio, but only as a back-compat fallback.
+            bs = agreement.get("batfish_simulate_s")
+            hs = agreement.get("hammerhead_simulate_s")
+            if bs is not None and hs is not None and hs > 0:
+                fair_ratio = bs / hs
+        nodes = agreement.get("nodes")
+        routes_cell = (
+            f"{agreement.get('batfish_routes', '-')} / "
+            f"{agreement.get('hammerhead_routes', '-')}"
+        )
         lines.append(
             f"| {row.topology} | {status} | "
-            f"{agreement.get('batfish_routes', '-')} | "
-            f"{agreement.get('hammerhead_routes', '-')} | "
-            f"{agreement.get('both_sides_keys', '-')} | "
-            f"{agreement.get('union_keys', '-')} | "
+            f"{nodes if nodes is not None else '-'} | "
+            f"{routes_cell} | "
             f"{_fmt_rate(presence_val)} | "
             f"{_fmt_rate(agreement.get('next_hop_agreement'))} | "
-            f"{_fmt_rate(agreement.get('protocol_agreement'))} | "
-            f"{_fmt_rate(agreement.get('bgp_attr_agreement'))} | "
-            f"{bf_cell} | "
-            f"{bf_solve} | "
-            f"{hh_cell} | "
-            f"{ratio_cell} |"
+            f"{bf_wall_cell} | "
+            f"{hh_wall_cell} | "
+            f"{_fmt_solve_ratio(wall_ratio)} | "
+            f"{_fmt_solve_ratio(fair_ratio)} |"
         )
+    lines.append("")
+    lines.append(
+        "Wall ratio includes JVM startup and snapshot upload on the "
+        "Batfish side; fair ratio is the apples-to-apples "
+        "solve+materialize comparison defined in README § 2."
+    )
     return lines
 
 

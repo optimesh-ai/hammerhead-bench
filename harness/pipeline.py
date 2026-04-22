@@ -385,6 +385,16 @@ def _write_metrics(metrics: TopologyMetrics, path: Path) -> None:
 # ---- sim-only path (Phase 11) --------------------------------------------
 
 
+# In-band caveat emitted alongside the Hammerhead-favoring ``asym_ratio``
+# key in every ``results/<topology>.json``. Re-stated verbatim here (not
+# just in the README) so a downstream script that only ingests the JSON
+# can't miss it. README § 2 carries the formal definition.
+ASYM_RATIO_NOTE = (
+    "Hammerhead-favoring lower bound; see README §2. "
+    "Do not cite as headline."
+)
+
+
 @dataclass(slots=True)
 class SimOnlyAgreement:
     """Head-to-head agreement metrics when vendor truth is not available.
@@ -414,6 +424,10 @@ class SimOnlyAgreement:
     next_hop_agreement: float
     protocol_agreement: float
     bgp_attr_agreement: float
+    # Node count for the topology (``len(spec.nodes)``). Stamped at run time
+    # so the report renderer and the § 1 table can surface it as a column
+    # without re-reading the topology YAML. ``None`` on pre-nodes sidecars.
+    nodes: int | None = None
     batfish_wall_s: float | None = None
     hammerhead_wall_s: float | None = None
     batfish_simulate_s: float | None = None
@@ -506,6 +520,11 @@ class SimOnlyAgreement:
         scrutiny — every §1 cell is "equivalent work on each side,
         wall-clock."
 
+        Also exposed in the results JSON under the canonical key
+        ``fair_ratio`` (README § 2 formal definition); ``solve_ratio``
+        /``asym_ratio`` are the Hammerhead-favoring lower-bound
+        counterpart and must not be cited as headline.
+
         None when either the Batfish sidecar stat or the Hammerhead
         combined denominator is missing or zero.
         """
@@ -517,14 +536,42 @@ class SimOnlyAgreement:
             return None
         return self.batfish_simulate_s / self.hammerhead_simulate_plus_rib_s
 
+    def wall_ratio(self) -> float | None:
+        """``batfish_wall_s / hammerhead_wall_s`` — end-to-end wall-clock ratio.
+
+        Numerator is the full Batfish path: JVM cold-start + pybatfish
+        init + snapshot upload + solve + result materialization.
+        Denominator is the full Hammerhead path: ``simulate`` +
+        ``rib`` subprocess spawn + JSON parse + disk write. This is the
+        **conservative-upper-bound** ratio: at small topologies the
+        numerator is dominated by one-time JVM startup, so the ratio
+        overstates the true solver speedup. Always reported alongside
+        ``fair_ratio`` in the § 1 table.
+        """
+        if self.batfish_wall_s is None or self.hammerhead_wall_s is None:
+            return None
+        if self.hammerhead_wall_s <= 0:
+            return None
+        return self.batfish_wall_s / self.hammerhead_wall_s
+
     def as_dict(self) -> dict:
         from dataclasses import asdict  # noqa: PLC0415
 
         d = asdict(self)
         d["coverage"] = self.coverage
         d["presence"] = self.presence
-        d["solve_ratio"] = self.solve_ratio()
-        d["solve_plus_materialize_ratio"] = self.solve_plus_materialize_ratio()
+        # Canonical keys (README § 2 formal definitions). ``fair_ratio``
+        # is the headline; ``asym_ratio`` is the Hammerhead-favoring
+        # lower bound and carries an in-band caveat so a downstream
+        # consumer reading only the JSON can't miss it.
+        d["wall_ratio"] = self.wall_ratio()
+        d["fair_ratio"] = self.solve_plus_materialize_ratio()
+        d["asym_ratio"] = self.solve_ratio()
+        d["asym_ratio_note"] = ASYM_RATIO_NOTE
+        # Legacy aliases — retained so pre-rename result consumers keep
+        # parsing. New consumers should read the canonical keys above.
+        d["solve_ratio"] = d["asym_ratio"]
+        d["solve_plus_materialize_ratio"] = d["fair_ratio"]
         return d
 
 
@@ -663,6 +710,7 @@ def run_topology_sim_only(
             hammerhead_sims=hammer_sims,
             batfish_inits=batfish_inits,
             hammerhead_ribs=hammer_ribs,
+            nodes=len(spec.nodes),
         )
         result.agreement = agreement
         result.diff_path = diff_dir
@@ -687,6 +735,7 @@ def _compute_sim_only_agreement(
     hammerhead_sims: list[float],
     batfish_inits: list[float] | None = None,
     hammerhead_ribs: list[float] | None = None,
+    nodes: int | None = None,
 ) -> SimOnlyAgreement:
     """Diff Batfish and Hammerhead head-to-head; write records + agreement.json.
 
@@ -782,18 +831,41 @@ def _compute_sim_only_agreement(
         len(hammerhead_sims),
     )
     if n_trials >= 2:
+        # Paired per-trial sums for the fair-ratio denominator, so
+        # ``trial_stats["hammerhead_simulate_plus_rib_s"]`` reflects the
+        # real per-trial mean/std (not a synthetic sum of independent
+        # means). Falls back to sim-only when rib sidecars are missing.
+        if (
+            hammerhead_sims
+            and hammerhead_ribs
+            and len(hammerhead_sims) == len(hammerhead_ribs)
+        ):
+            hh_sim_plus_rib_series: list[float] = [
+                s + r
+                for s, r in zip(hammerhead_sims, hammerhead_ribs, strict=True)
+            ]
+        else:
+            hh_sim_plus_rib_series = list(hammerhead_sims)
         trials_payload = {
             "n": n_trials,
             "batfish_wall_s": list(batfish_walls),
             "hammerhead_wall_s": list(hammerhead_walls),
             "batfish_simulate_s": list(batfish_sims),
             "hammerhead_simulate_s": list(hammerhead_sims),
+            "hammerhead_rib_total_s": list(hammerhead_ribs or []),
+            "hammerhead_simulate_plus_rib_s": hh_sim_plus_rib_series,
+            "batfish_init_snapshot_s": list(batfish_inits or []),
         }
         stats_payload = {
             "batfish_wall_s": _summarize_timings(batfish_walls),
             "hammerhead_wall_s": _summarize_timings(hammerhead_walls),
             "batfish_simulate_s": _summarize_timings(batfish_sims),
             "hammerhead_simulate_s": _summarize_timings(hammerhead_sims),
+            "hammerhead_rib_total_s": _summarize_timings(hammerhead_ribs or []),
+            "hammerhead_simulate_plus_rib_s": _summarize_timings(
+                hh_sim_plus_rib_series
+            ),
+            "batfish_init_snapshot_s": _summarize_timings(batfish_inits or []),
         }
 
     agreement = SimOnlyAgreement(
@@ -805,6 +877,7 @@ def _compute_sim_only_agreement(
         next_hop_agreement=nh_agree / denom_both if both_keys else 1.0,
         protocol_agreement=proto_agree / denom_both if both_keys else 1.0,
         bgp_attr_agreement=bgp_agree / bgp_total if bgp_total else 1.0,
+        nodes=nodes,
         batfish_wall_s=bf_wall_mean,
         hammerhead_wall_s=hh_wall_mean,
         batfish_simulate_s=bf_sim_mean,
@@ -1038,6 +1111,36 @@ class ThreeWayAgreement:
         d["batfish_vs_truth_coverage"] = self.batfish_vs_truth_presence
         d["hammerhead_vs_truth_coverage"] = self.hammerhead_vs_truth_presence
         d["batfish_vs_hammerhead_coverage"] = self.batfish_vs_hammerhead_presence
+        # Canonical ratio keys — same shape as
+        # :meth:`SimOnlyAgreement.as_dict` so a downstream tool indexes
+        # the same key regardless of whether the topology carried truth.
+        wall_ratio = (
+            self.batfish_wall_s / self.hammerhead_wall_s
+            if self.batfish_wall_s is not None
+            and self.hammerhead_wall_s is not None
+            and self.hammerhead_wall_s > 0
+            else None
+        )
+        fair_ratio = (
+            self.batfish_simulate_s / self.hammerhead_simulate_plus_rib_s
+            if self.batfish_simulate_s is not None
+            and self.hammerhead_simulate_plus_rib_s is not None
+            and self.hammerhead_simulate_plus_rib_s > 0
+            else None
+        )
+        asym_ratio = (
+            self.batfish_simulate_s / self.hammerhead_simulate_s
+            if self.batfish_simulate_s is not None
+            and self.hammerhead_simulate_s is not None
+            and self.hammerhead_simulate_s > 0
+            else None
+        )
+        d["wall_ratio"] = wall_ratio
+        d["fair_ratio"] = fair_ratio
+        d["asym_ratio"] = asym_ratio
+        d["asym_ratio_note"] = ASYM_RATIO_NOTE
+        d["solve_ratio"] = asym_ratio
+        d["solve_plus_materialize_ratio"] = fair_ratio
         return d
 
 
