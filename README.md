@@ -195,11 +195,19 @@ Cross-validation against vendor ground truth is the job of
 We flag each of the following so that readers can judge how much
 of the headline ratio they should trust.
 
-- **N = 1.** The numbers in § 1 are from a single run per
-  topology. We do not report variance, confidence intervals, or
-  distribution tails. A minority of small-topology Batfish
-  runs vary by 1–3 s across reruns on the same host because
-  JVM first-pass class-loading is non-deterministic.
+- **Variance is measured, but on one host.** The wall-clock
+  columns in § 1 are `mean ± std` over `--trials 5` (the CLI
+  default); per-trial timings are stored under
+  `results/<topology>.json` `agreement.trials` + `trial_stats`
+  for independent inspection. What we do *not* claim: that the
+  distribution is Gaussian, that 5 samples resolve the tail, or
+  that a different host would see the same spread. JVM
+  first-pass class-loading is the usual source of Batfish
+  variance on small topologies (1–3 s across reruns); it
+  survives `--trials` because each trial starts a fresh
+  container on purpose, so the measured std is an honest
+  reflection of what a production user re-running a snapshot
+  would see.
 - **JVM cold-start is in the Batfish wall-clock.** Every
   Batfish run starts a fresh `batfish/allinone` container and
   pays the JVM startup cost (~15–20 s on our host). This is
@@ -216,27 +224,37 @@ of the headline ratio they should trust.
   not verified that claim ourselves.
 - **Sim-only mode runs no convergence.** In sim-only mode,
   neither Batfish nor Hammerhead boots a real router, so
-  timing does not include protocol convergence. The
-  `--with-truth` mode *does* include containerlab boot and
-  convergence wait, and is correspondingly slower; cross-
-  validation there is beyond the scope of this artifact's
-  headline numbers.
+  timing does not include protocol convergence. Cross-
+  validation against vendor-produced RIBs is surfaced
+  separately in § 1.1 ("Ground-truth agreement (FRR subset)")
+  when a `--frr-only-truth` run is on record; that mode is
+  Linux-only (it uses containerlab + Docker) and is restricted
+  to FRR-based topologies of ≤ 20 nodes, so the subset is a
+  genuine subset of the corpus, not a replacement for the
+  headline sim-only numbers.
 - **Route-count asymmetry is a modeling difference, not
   disagreement.** Batfish materializes /32 loopback host
   routes on every node; Hammerhead elides them. At 100 nodes
   this is a ~950-route gap. Because these prefixes are in
   `B \ H`, they are outside `B ∩ H` and do not enter the
-  agreement metric of § 2. This is a deliberate choice;
-  we document it rather than "fix" it because both behaviors
-  are defensible, and we do not want to bias the
-  comparison by post-processing one tool to look like the
-  other.
+  `next_hop_agree(t)` / `protocol_agree(t)` /
+  `bgp_attr_agree(t)` metrics of § 2; they *do* lower
+  `presence_agree(t)` (Jaccard) because they enlarge the union.
+  The per-topology table in § 1 therefore separates "presence"
+  from the attribute agreement rates, so a reader can see
+  exactly how much of any given gap is modeling asymmetry vs.
+  substantive disagreement. This is a deliberate choice; we
+  document it rather than post-process one tool's output to
+  mirror the other's.
 - **Batfish wall-clock includes pybatfish init + snapshot
   upload.** We do not subtract these. They are ~1 s on our
   host, dwarfed by JVM startup at small sizes and by
-  simulation at large sizes. Consult `results/<topology>.json`
-  for `batfish_simulate_s` (the inner simulate call only)
-  if you want to extract just the solve time.
+  simulation at large sizes. The § 1 table's "B solve (s)"
+  and "solve ratio" columns use `batfish_simulate_s` /
+  `hammerhead_simulate_s` (the inner solver calls only) for
+  an apples-to-apples solver comparison alongside the
+  wall-clock ratio; both are reported so a reader can judge
+  which one they care about.
 - **One topology is still gated.** `acl-semantics-3node`
   requires cEOS-lab for the flow-level ACL audit and is
   excluded from the 16-topology count here.
