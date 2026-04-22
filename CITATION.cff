@@ -1,0 +1,34 @@
+cff-version: 1.2.0
+message: >-
+  If you use this benchmark or its corpus in your research, please cite it as
+  below.
+title: "hammerhead-bench: An Open Corpus for Head-to-Head Comparison of Network Control-Plane Simulators"
+authors:
+  - family-names: Mallela
+    given-names: Vedu
+    email: vedu.mallela@gmail.com
+  - name: "Optimesh contributors"
+repository-code: "https://github.com/optimesh-ai/hammerhead-bench"
+url: "https://github.com/optimesh-ai/hammerhead-bench"
+abstract: >-
+  An open benchmark corpus and measurement harness for empirical head-to-head
+  comparison of network control-plane simulators. Includes 16 topologies
+  spanning 2-100 nodes and seven control-plane axes (BGP, OSPFv2, IS-IS,
+  multi-vendor, ACL-dominant parse, Clos and hub-and-spoke scale), a diff
+  engine computing formal next-hop / protocol / BGP-attribute agreement on
+  set-intersection (node, vrf, prefix) cells, and pinned container-image
+  digests for reproducibility. The reference measurement compares Hammerhead
+  against Batfish on a single laptop in sim-only mode; a separate with-truth
+  mode cross-validates against live FRR and Arista cEOS-lab ground truth.
+keywords:
+  - network-verification
+  - control-plane-simulation
+  - BGP
+  - OSPF
+  - ISIS
+  - batfish
+  - benchmark
+  - reproducibility
+license: Apache-2.0
+version: "0.2.0"
+date-released: "2026-04-21"

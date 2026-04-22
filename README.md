@@ -328,7 +328,31 @@ and the full report generator (loader + three plot factories
 + HTML + Markdown). The one skipped test runs only when
 Docker + containerlab are present on the host.
 
-## 9. Limitations and honest caveats
+## 9. Vendor support
+
+- ✅ **FRR** (`frrouting/frr`) — full vendor-truth + convergence
+  + FIB extraction in `--with-truth` mode.
+- ✅ **Arista cEOS-lab** — full; user supplies the image
+  (Arista EOS Central, free account).
+- 🧱 **Juniper crpd** — scaffolded; adapter currently raises
+  `NotImplementedError`.
+- 🧱 **Nokia SR Linux** — scaffolded.
+- 🧱 **Cisco XRd** — scaffolded; skipped by default for
+  memory reasons even when wired.
+
+## 10. CLI
+
+```
+hammerhead-bench preflight                                 # host sanity check
+hammerhead-bench smoke --topology bgp-ibgp-2node           # one topology end-to-end
+hammerhead-bench bench [--only NAME] [--skip NAME]         # full corpus
+               [--max-nodes N] [--with-acl-semantics]
+               [--no-batfish] [--no-hammerhead]
+               [--keep-lab-on-failure] [-v]
+hammerhead-bench report --results-dir results/             # regenerate HTML + MD
+```
+
+## 11. Limitations and honest caveats
 
 Beyond the threats in § 3:
 
@@ -358,9 +382,11 @@ Beyond the threats in § 3:
   source-available; any reader who suspects a methodological
   bias is invited to re-run with a modified harness.
 
-## 10. Citation
+## 12. Citation
 
-Until a PDF writeup lands, please cite this repository:
+Until a PDF writeup lands, please cite this repository. A
+machine-readable `CITATION.cff` is provided at the repo root;
+GitHub renders a "Cite this repository" button that consumes it.
 
 ```bibtex
 @misc{hammerhead-bench-2026,
@@ -369,33 +395,14 @@ Until a PDF writeup lands, please cite this repository:
   author = {Mallela, Vedu and {Optimesh contributors}},
   year   = {2026},
   howpublished = {\url{https://github.com/optimesh-ai/hammerhead-bench}},
-  note   = {Commit <git-sha>, accessed YYYY-MM-DD}
+  note   = {Commit \texttt{a195f09}, accessed 2026-04-21}
 }
 ```
 
-## 11. Vendor support
-
-- ✅ **FRR** (`frrouting/frr`) — full vendor-truth + convergence
-  + FIB extraction in `--with-truth` mode.
-- ✅ **Arista cEOS-lab** — full; user supplies the image
-  (Arista EOS Central, free account).
-- 🧱 **Juniper crpd** — scaffolded; adapter currently raises
-  `NotImplementedError`.
-- 🧱 **Nokia SR Linux** — scaffolded.
-- 🧱 **Cisco XRd** — scaffolded; skipped by default for
-  memory reasons even when wired.
-
-## 12. CLI
-
-```
-hammerhead-bench preflight                                 # host sanity check
-hammerhead-bench smoke --topology bgp-ibgp-2node           # one topology end-to-end
-hammerhead-bench bench [--only NAME] [--skip NAME]         # full corpus
-               [--max-nodes N] [--with-acl-semantics]
-               [--no-batfish] [--no-hammerhead]
-               [--keep-lab-on-failure] [-v]
-hammerhead-bench report --results-dir results/             # regenerate HTML + MD
-```
+When citing specific numbers from § 1, please also cite the
+pinned Batfish digest from `versions.lock` and the Hammerhead
+commit hash from your `.env` so the comparison is
+reproducible against the same tool versions.
 
 ## License
 
