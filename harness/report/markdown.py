@@ -192,6 +192,15 @@ def _sim_only_per_topology_table(topologies: list[TopologyRow]) -> list[str]:
     ``metrics`` field is always ``None`` in sim-only mode. When trials > 1,
     the wall-clock columns render as ``mean ± std`` using the per-topology
     ``agreement.trial_stats`` payload.
+
+    Columns:
+
+    - ``presence`` — ``|B ∩ H| / |B ∪ H|`` (Jaccard; ``agreement.presence``
+      in the JSON, README § 2 carries the formal definition).
+    - ``B solve (s)`` — ``agreement.batfish_simulate_s`` (inner
+      pybatfish solve time, excluding JVM startup + upload).
+    - ``solve ratio`` — ``batfish_simulate_s / hammerhead_simulate_s``,
+      the apples-to-apples solver-only speedup.
     """
     lines = ["## Per-topology"]
     if not topologies:
@@ -201,16 +210,20 @@ def _sim_only_per_topology_table(topologies: list[TopologyRow]) -> list[str]:
     lines.append("")
     lines.append(
         "| Topology | Status | B routes | H routes | "
-        "`|∩|` | `|∪|` | coverage | "
-        "next-hop | proto | BGP attr | B wall (s) | H wall (s) |"
+        "`|∩|` | `|∪|` | presence | "
+        "next-hop | proto | BGP attr | "
+        "B wall (s) | B solve (s) | H wall (s) | solve ratio |"
     )
-    lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    lines.append(
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+    )
     for row in topologies:
         status = row.run.get("status", "?")
         agreement = row.run.get("agreement") or {}
         if not agreement:
             lines.append(
-                f"| {row.topology} | {status} | - | - | - | - | - | - | - | - | - | - |"
+                f"| {row.topology} | {status} | "
+                "- | - | - | - | - | - | - | - | - | - | - | - |"
             )
             continue
         trial_stats = agreement.get("trial_stats") or {}
@@ -222,18 +235,36 @@ def _sim_only_per_topology_table(topologies: list[TopologyRow]) -> list[str]:
             agreement.get("hammerhead_wall_s"),
             trial_stats.get("hammerhead_wall_s"),
         )
+        bf_solve = _fmt_wall_with_std(
+            agreement.get("batfish_simulate_s"),
+            trial_stats.get("batfish_simulate_s"),
+        )
+        presence_val = agreement.get("presence")
+        if presence_val is None:
+            # pre-presence JSON → compute on the fly from the Jaccard inputs
+            presence_val = agreement.get("coverage")
+        ratio = agreement.get("solve_ratio")
+        if ratio is None:
+            # back-fill from simulate_s fields (pre-solve_ratio JSONs)
+            bf_s = agreement.get("batfish_simulate_s")
+            hh_s = agreement.get("hammerhead_simulate_s")
+            if bf_s is not None and hh_s is not None and hh_s > 0:
+                ratio = bf_s / hh_s
+        ratio_cell = _fmt_solve_ratio(ratio)
         lines.append(
             f"| {row.topology} | {status} | "
             f"{agreement.get('batfish_routes', '-')} | "
             f"{agreement.get('hammerhead_routes', '-')} | "
             f"{agreement.get('both_sides_keys', '-')} | "
             f"{agreement.get('union_keys', '-')} | "
-            f"{_fmt_rate(agreement.get('coverage'))} | "
+            f"{_fmt_rate(presence_val)} | "
             f"{_fmt_rate(agreement.get('next_hop_agreement'))} | "
             f"{_fmt_rate(agreement.get('protocol_agreement'))} | "
             f"{_fmt_rate(agreement.get('bgp_attr_agreement'))} | "
             f"{bf_cell} | "
-            f"{hh_cell} |"
+            f"{bf_solve} | "
+            f"{hh_cell} | "
+            f"{ratio_cell} |"
         )
     return lines
 
@@ -333,6 +364,18 @@ def _fmt_wall(s: float | None) -> str:
     if s is None:
         return "-"
     return f"{s:.2f}"
+
+
+def _fmt_solve_ratio(ratio: float | None) -> str:
+    """Render ``batfish_simulate_s / hammerhead_simulate_s`` as ``N.N×``.
+
+    None or non-positive ratios render as ``-`` so the column reader can
+    spot "Batfish solve stat missing / Hammerhead solve time zero" rows
+    without decoding a float.
+    """
+    if ratio is None or ratio <= 0:
+        return "-"
+    return f"{ratio:.1f}\u00d7"
 
 
 def _fmt_wall_with_std(scalar: float | None, stats: dict | None) -> str:

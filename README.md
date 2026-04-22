@@ -31,39 +31,61 @@ topology. We canonicalize next-hop descriptors before comparison
 (`AUTO/NONE`, `dynamic`, `null_interface` → `None`) so syntactic
 differences do not inflate disagreement.
 
-| Topology | Nodes | Routes (bf / hh) | NH agree | Batfish wall | Hammerhead wall | Ratio |
-|---|---:|---:|---:|---:|---:|---:|
-| `bgp-ebgp-2node` | 2 | 6 / 4 | 100% | 29.42 s | 0.037 s | 788.6× |
-| `bgp-ibgp-2node` | 2 | 0 / 4 | 100% | 22.96 s | 0.039 s | 593.5× |
-| `acl-heavy-parse` | 3 | 12 / 6 | 100% | 35.44 s | 0.048 s | 739.1× |
-| `ospf-p2p-3node` | 3 | 12 / 6 | 100% | 30.79 s | 0.046 s | 675.1× |
-| `route-map-pathological` | 3 | 0 / 12 | 100% | 26.90 s | 0.048 s | 555.4× |
-| `isis-l1l2-4node` | 4 | 26 / 26 | 100% | 28.63 s | 0.060 s | 480.9× |
-| `mixed-vendor-frr-ceos-4node` | 4 | 8 / 8 | 100% | 28.76 s | 0.055 s | 518.5× |
-| `mpls-l3vpn-4node` | 4 | 8 / 8 | 100% | 31.58 s | 0.067 s | 469.4× |
-| `ospf-broadcast-4node` | 4 | 8 / 4 | 100% | 30.65 s | 0.054 s | 563.9× |
-| `multi-as-edge-5node` | 5 | 32 / 27 | 100% | 33.04 s | 0.068 s | 486.2× |
-| `spine-leaf-6node` | 6 | 52 / 36 | 100% | 31.55 s | 0.071 s | 441.7× |
-| `route-reflector-6node` | 6 | 0 / 36 | 100% | 28.46 s | 0.082 s | 349.0× |
-| `spine-leaf-20node` | 20 | 560 / 432 | 100% | 42.53 s | 0.251 s | 169.4× |
-| `spine-leaf-50node` | 50 | 2,990 / 2,622 | 100% | 56.88 s | 1.357 s | 41.9× |
-| `hub-spoke-wan-51node` | 51 | 5,351 / 5,251 | 100% | 56.02 s | 1.557 s | 36.0× |
-| `spine-leaf-100node` | 100 | 11,305 / 10,355 | 100% | 102.67 s | 9.513 s | 10.8× |
+| Topology | Nodes | Routes (bf / hh) | Presence | NH agree | Batfish wall | Batfish solve | Hammerhead wall | Solve ratio |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `bgp-ebgp-2node` | 2 | 4 / 4 | 100.0% | 100% | 20.35 s | 20.35 s | 0.035 s | 594.4× |
+| `bgp-ibgp-2node` | 2 | 4 / 4 | 100.0% | 100% | 21.42 s | 21.42 s | 0.037 s | 579.7× |
+| `acl-heavy-parse` | 3 | 15 / 6 | 40.0% | 100% | 22.14 s | 22.14 s | 0.044 s | 501.1× |
+| `ospf-p2p-3node` | 3 | 15 / 6 | 40.0% | 100% | 21.06 s | 21.06 s | 0.044 s | 480.3× |
+| `route-map-pathological` | 3 | 15 / 15 | 100.0% | 100% | 24.57 s | 24.57 s | 0.048 s | 520.9× |
+| `isis-l1l2-4node` | 4 | 6 / 26 | 23.1% | 100% | 20.53 s | 20.53 s | 0.056 s | 368.2× |
+| `mixed-vendor-frr-ceos-4node` | 4 | 12 / 8 | 66.7% | 100% | 30.89 s | 30.89 s | 0.054 s | 574.2× |
+| `mpls-l3vpn-4node` | 4 | 26 / 8 | 21.4% | 100% | 23.76 s | 23.76 s | 0.054 s | 444.6× |
+| `ospf-broadcast-4node` | 4 | 16 / 4 | 25.0% | 100% | 21.65 s | 21.65 s | 0.055 s | 392.7× |
+| `multi-as-edge-5node` | 5 | 27 / 27 | 100.0% | 100% | 23.10 s | 23.10 s | 0.063 s | 366.9× |
+| `spine-leaf-6node` | 6 | 36 / 36 | 100.0% | 100% | 25.24 s | 25.23 s | 0.072 s | 353.4× |
+| `route-reflector-6node` | 6 | 36 / 36 | 100.0% | 100% | 24.18 s | 24.18 s | 0.068 s | 359.3× |
+| `spine-leaf-20node` | 20 | 432 / 432 | 100.0% | 100% | 37.30 s | 37.29 s | 0.234 s | 159.5× |
+| `spine-leaf-50node` | 50 | 2,622 / 2,622 | 100.0% | 100% | 52.09 s | 52.08 s | 1.284 s | 40.6× |
+| `hub-spoke-wan-51node` | 51 | 5,251 / 5,251 | 100.0% | 100% | 43.26 s | 43.24 s | 1.130 s | 38.3× |
+| `spine-leaf-100node` | 100 | 10,355 / 10,355 | 100.0% | 100% | 91.93 s | 91.87 s | 8.869 s | 10.4× |
 
-**Aggregate over the corpus.** Cumulative wall-clock is **616.29 s
-for Batfish** and **13.35 s for Hammerhead**, a ratio of **46.2×**.
-Per-topology ratios span **10.8× – 788.6×** and, as § 3 explains,
-are dominated by JVM startup at small sizes and by simulation
-work at large sizes; we do not recommend citing the aggregate
-as a single headline speedup number without qualification.
+The `Batfish wall` column is end-to-end (container boot + pybatfish
+init + snapshot upload + solve); the `Batfish solve` column is the
+pybatfish-reported inner solve time only (what ends up in
+`agreement.batfish_simulate_s`). The `Solve ratio` column is
+`batfish_simulate_s / hammerhead_simulate_s` — the apples-to-apples
+solver speedup, excluding JVM startup on the numerator and harness
+fork-exec overhead on the denominator.
+
+The `Presence` column is the per-topology Jaccard
+`|B ∩ H| / |B ∪ H|` on `(node, vrf, prefix)` keys; see § 2 for
+the formal definition. Topologies below 100% presence (e.g.
+`isis-l1l2-4node` at 23.1%) reflect Batfish materializing /32
+loopback host routes that Hammerhead elides — a documented
+modeling difference rather than a simulator disagreement
+(§ 3 "Route-count asymmetry").
+
+**Aggregate over the corpus.** Cumulative Batfish wall-clock is
+**503.47 s** (end-to-end) and **503.36 s** (solve only);
+Hammerhead totals **12.15 s** in wall. The raw wall-clock ratio is
+**41.4×** and the solve-only ratio is **41.4×** — close because at
+this corpus size the JVM-startup share of Batfish wall-clock has
+been amortised by the accumulated solve time; at individual 2–6
+node topologies the end-to-end wall-clock remains JVM-dominated,
+which is why per-topology solve ratios span **10.4× – 594.4×**.
+We do not recommend citing any single aggregate as a headline
+speedup number without qualification; § 3 explains the regime
+structure.
 
 **Agreement.** On the intersection of (node, vrf, prefix) cells
-installed by both tools, all three equality relations below are
-100% across all 16 topologies:
-next-hop-set agreement, protocol agreement, and BGP-attribute
-agreement (AS_PATH, LOCAL_PREF, MED). Absolute cell counts and
-raw per-topology times are in `results/<topology>.json`; the
-rolled-up aggregate is in `results/bench_summary.json`.
+installed by both tools (the `|B ∩ H|` column in the per-topology
+report), all three equality relations — next-hop-set, protocol,
+and BGP-attribute (AS_PATH, LOCAL_PREF, MED) — are **100% across
+all 16 topologies**. Absolute cell counts, per-trial wall-clocks
+(when `--trials N` was used), and raw per-topology times are in
+`results/<topology>.json`; the rolled-up aggregate is in
+`results/bench_summary.json`.
 
 ## 2. Agreement metric (formal definition)
 
@@ -95,6 +117,21 @@ For each such cell, we define (exactly as implemented in
   (LOCAL_PREF(B) == LOCAL_PREF(H)) ∧ (MED(B) == MED(H))`. The
   `AS_PATH` comparison is length- and order-sensitive list
   equality; `None` matches `None` but `None` does not match `[]`.
+- **`presence_agree(t)`** — per-topology Jaccard overlap on the
+  key sets, measuring *which rows both tools produced at all*
+  independent of any inner-field equality. Formally, with
+  `K_B(t) := { (n, v, p) : B(t) has a route at (n, v, p) }` and
+  `K_H(t)` analogously,
+  `presence_agree(t) := |K_B(t) ∩ K_H(t)| / |K_B(t) ∪ K_H(t)|`
+  with the convention `presence_agree(t) := 1.0` when
+  `|K_B(t) ∪ K_H(t)| = 0` (no rows on either side — a vacuous
+  truth, not a claim). This is surfaced in
+  `agreement.presence` (and the identically-valued alias
+  `agreement.coverage`) in every `results/<topology>.json`
+  and as the `Presence` column in the § 1 table. It is the
+  sim-only analogue of the 3-way `presence_match_rate` the
+  vendor-truth path reports against live FRR / cEOS; see
+  `harness/diff/metrics.py` for the 3-way shape.
 
 Per-topology agreement is the unweighted cell-level mean of each
 relation over `B ∩ H` (over BGP-cells for `bgp_attrs_agree`).

@@ -430,16 +430,51 @@ class SimOnlyAgreement:
         key sets. Reviewers should read :attr:`next_hop_agreement` only
         in conjunction with :attr:`coverage` \u2014 an agreement rate of
         1.0 over 0 shared rows is not a claim, it's a vacuous truth.
+
+        This is the **presence agreement** metric per-topology; see
+        :attr:`presence` for the identically-valued alias that matches
+        the 3-way-truth ``presence_match_rate`` academic terminology.
         """
         if self.union_keys == 0:
             return 1.0
         return self.both_sides_keys / self.union_keys
+
+    @property
+    def presence(self) -> float:
+        """Per-topology presence agreement (alias for :attr:`coverage`).
+
+        Defined as ``|B \u2229 H| / |B \u222a H|`` where ``B`` and ``H`` are
+        the sets of ``(node, vrf, prefix)`` keys produced by Batfish and
+        Hammerhead on the topology. This is the sim-only analogue of the
+        ``presence_match_rate`` metric the 3-way-truth path reports
+        against vendor ground truth (see ``harness/diff/metrics.py``).
+        Surfaced as its own field so README \u00a7 2 can formalise the
+        definition under a stable key instead of piggy-backing on the
+        implementation-named ``coverage``.
+        """
+        return self.coverage
+
+    def solve_ratio(self) -> float | None:
+        """``batfish_simulate_s / hammerhead_simulate_s`` — solver-only speedup.
+
+        None when either sidecar stat is missing or ``hammerhead_simulate_s``
+        is zero. This is the apples-to-apples ratio that excludes JVM
+        startup + pybatfish init from the Batfish numerator and
+        harness-fork-exec overhead from the Hammerhead denominator.
+        """
+        if self.batfish_simulate_s is None or self.hammerhead_simulate_s is None:
+            return None
+        if self.hammerhead_simulate_s <= 0:
+            return None
+        return self.batfish_simulate_s / self.hammerhead_simulate_s
 
     def as_dict(self) -> dict:
         from dataclasses import asdict  # noqa: PLC0415
 
         d = asdict(self)
         d["coverage"] = self.coverage
+        d["presence"] = self.presence
+        d["solve_ratio"] = self.solve_ratio()
         return d
 
 

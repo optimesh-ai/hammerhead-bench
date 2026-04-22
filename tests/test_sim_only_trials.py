@@ -142,6 +142,68 @@ def test_run_topology_sim_only_trials_collects_per_trial_timings(tmp_path: Path)
     assert stats["hammerhead_simulate_s"]["std"] == pytest.approx(0.0)
 
 
+def test_agreement_exposes_presence_and_solve_ratio(tmp_path: Path) -> None:
+    """Agreement JSON carries ``presence`` (Jaccard alias of ``coverage``)
+    and ``solve_ratio`` (``batfish_simulate_s / hammerhead_simulate_s``).
+    Both are needed by README §1 table + §2 formal definition."""
+    spec = load_spec(TOPO_DIR)
+    hooks = BenchHooks(
+        batfish=_CountingHook(source="batfish", simulate_s=0.84),
+        hammerhead=_CountingHook(source="hammerhead", simulate_s=0.02),
+    )
+    result = run_topology_sim_only(
+        spec,
+        workdir=tmp_path / "workdir",
+        results_dir=tmp_path / "results",
+        hooks=hooks,
+    )
+    a = result.agreement
+    assert a is not None
+    d = a.as_dict()
+    # presence == coverage (Jaccard), both exposed.
+    assert "presence" in d
+    assert "coverage" in d
+    assert d["presence"] == d["coverage"] == a.coverage
+    # Both-present case on the tiny fixture → identical FIBs → Jaccard 1.0.
+    assert d["presence"] == pytest.approx(1.0)
+    # solve_ratio uses the simulate_s sidecar (not wall).
+    assert d["solve_ratio"] == pytest.approx(0.84 / 0.02)
+    assert a.solve_ratio() == pytest.approx(0.84 / 0.02)
+
+
+def test_solve_ratio_returns_none_when_simulate_stat_missing() -> None:
+    from harness.pipeline import SimOnlyAgreement  # noqa: PLC0415
+
+    a = SimOnlyAgreement(
+        topology="toy",
+        batfish_routes=4,
+        hammerhead_routes=4,
+        union_keys=4,
+        both_sides_keys=4,
+        next_hop_agreement=1.0,
+        protocol_agreement=1.0,
+        bgp_attr_agreement=1.0,
+        batfish_simulate_s=None,
+        hammerhead_simulate_s=0.5,
+    )
+    assert a.solve_ratio() is None
+    assert a.as_dict()["solve_ratio"] is None
+
+    b = SimOnlyAgreement(
+        topology="toy",
+        batfish_routes=4,
+        hammerhead_routes=4,
+        union_keys=4,
+        both_sides_keys=4,
+        next_hop_agreement=1.0,
+        protocol_agreement=1.0,
+        bgp_attr_agreement=1.0,
+        batfish_simulate_s=10.0,
+        hammerhead_simulate_s=0.0,
+    )
+    assert b.solve_ratio() is None
+
+
 def test_run_topology_sim_only_rejects_trials_zero(tmp_path: Path) -> None:
     spec = load_spec(TOPO_DIR)
     with pytest.raises(ValueError, match="trials must be >= 1"):
