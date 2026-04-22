@@ -236,8 +236,9 @@ class _FakeRunner:
         self.started.append(cfg)
         return "fake-container-id"
 
-    def wait_ready(self, cfg: BatfishConfig) -> None:
+    def wait_ready(self, cfg: BatfishConfig, container_id: str) -> None:
         self.wait_calls += 1
+        assert container_id  # non-empty — the harness passes start()'s return here
         if self.fail_wait:
             raise TimeoutError(f"Batfish did not start within {cfg.startup_timeout_s}s")
 
@@ -272,8 +273,12 @@ def test_run_batfish_writes_per_node_vrf_json(tmp_path: Path) -> None:
     assert runner.started and runner.stopped == ["fake-container-id"]
     assert runner.wait_calls == 1
 
-    # init_snapshot got the configs dir.
-    assert session.inits[0][0] == str(configs)
+    # init_snapshot got a staged snapshot root (not configs itself).
+    # Batfish requires <root>/configs/<device>.cfg layout; the harness
+    # stages a temp root and copies configs in flat.
+    staged_root = Path(session.inits[0][0])
+    assert staged_root.name.startswith("bf-snap-")
+    assert session.inits[0][1] == "bench-bgp-ibgp-2node"
 
     # One JSON per (node, vrf).
     files = sorted(p.name for p in out.iterdir() if p.suffix == ".json")

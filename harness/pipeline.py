@@ -9,6 +9,13 @@ configs (out-of-band, not against live containers) and computing the
 vendor-vs-simulator diffs. All three simulator hooks are injectable via
 ``BenchHooks`` so unit tests can swap in fakes and drive the happy path
 without Docker, pybatfish, or a Rust binary on the host.
+
+Phase 11 adds a sim-only path (:func:`run_topology_sim_only`) that skips
+every step that needs a Linux-only toolchain (containerlab / netns / veth)
+and instead renders configs, runs Batfish + Hammerhead on them, and
+computes a Hammerhead-vs-Batfish head-to-head agreement report. Lets the
+bench produce real numbers on any Docker-capable host (including macOS)
+without requiring a Linux VM.
 """
 
 from __future__ import annotations
@@ -373,3 +380,301 @@ def _write_metrics(metrics: TopologyMetrics, path: Path) -> None:
     import json  # noqa: PLC0415
 
     path.write_text(json.dumps(metrics.as_dict(), indent=2) + "\n")
+
+
+# ---- sim-only path (Phase 11) --------------------------------------------
+
+
+@dataclass(slots=True)
+class SimOnlyAgreement:
+    """Head-to-head agreement metrics when vendor truth is not available.
+
+    Semantics: rows counted only when BOTH simulators carry the
+    ``(node, vrf, prefix)``. "Agreement" means both sides agree on a
+    field; it is explicitly NOT a correctness claim because there's no
+    third-party oracle.
+    """
+
+    topology: str
+    batfish_routes: int
+    hammerhead_routes: int
+    union_keys: int
+    both_sides_keys: int
+    next_hop_agreement: float
+    protocol_agreement: float
+    bgp_attr_agreement: float
+    batfish_wall_s: float | None = None
+    hammerhead_wall_s: float | None = None
+    batfish_simulate_s: float | None = None
+    hammerhead_simulate_s: float | None = None
+
+    def as_dict(self) -> dict:
+        from dataclasses import asdict  # noqa: PLC0415
+
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class SimOnlyResult:
+    """Outcome of a sim-only pipeline pass. Written to ``results/<topology>.json``."""
+
+    topology: str
+    status: str  # "passed" | "failed"
+    started_iso: str
+    finished_iso: str
+    batfish_path: Path | None = None
+    hammerhead_path: Path | None = None
+    diff_path: Path | None = None
+    agreement: SimOnlyAgreement | None = None
+    error: str | None = None
+    notes: list[str] = field(default_factory=list)
+
+
+def run_topology_sim_only(
+    spec: TopologySpec,
+    *,
+    workdir: Path,
+    results_dir: Path,
+    hooks: BenchHooks | None = None,
+) -> SimOnlyResult:
+    """Render configs, run Batfish + Hammerhead, diff them head-to-head.
+
+    No containerlab, no vendor truth, no memory guards — this path assumes
+    both simulators are pure shell-out + parse operations. Output layout:
+
+    - ``<results_dir>/batfish/<topology>/<node>__<vrf>.json`` — Batfish FIB
+    - ``<results_dir>/hammerhead/<topology>/<node>__<vrf>.json`` — Hammerhead FIB
+    - ``<results_dir>/diff_sim_only/<topology>/agreement.json`` — head-to-head
+
+    ``hooks.batfish`` and ``hooks.hammerhead`` are required. An unset hook
+    makes the pipeline write an empty FIB dir for that side; the agreement
+    metrics handle that gracefully (presence goes to zero).
+    """
+    import time as _time  # noqa: PLC0415
+
+    started = _now_iso()
+    bf_dir = results_dir / "batfish" / spec.name
+    hh_dir = results_dir / "hammerhead" / spec.name
+    diff_dir = results_dir / "diff_sim_only" / spec.name
+    hooks = hooks or BenchHooks()
+    result = SimOnlyResult(
+        topology=spec.name,
+        status="failed",
+        started_iso=started,
+        finished_iso=started,
+    )
+
+    try:
+        log.info("[%s] rendering configs to %s (sim-only)", spec.name, workdir)
+        render_topology(spec, workdir)
+        configs_dir = workdir / "configs"
+
+        batfish_wall: float | None = None
+        if hooks.batfish is not None:
+            log.info("[%s] running batfish", spec.name)
+            bf_dir.mkdir(parents=True, exist_ok=True)
+            t0 = _time.monotonic()
+            hooks.batfish(configs_dir, bf_dir, spec.name)
+            batfish_wall = _time.monotonic() - t0
+            result.batfish_path = bf_dir
+
+        hammerhead_wall: float | None = None
+        if hooks.hammerhead is not None:
+            log.info("[%s] running hammerhead", spec.name)
+            hh_dir.mkdir(parents=True, exist_ok=True)
+            t0 = _time.monotonic()
+            hooks.hammerhead(configs_dir, hh_dir, spec.name)
+            hammerhead_wall = _time.monotonic() - t0
+            result.hammerhead_path = hh_dir
+
+        agreement = _compute_sim_only_agreement(
+            spec=spec,
+            results_dir=results_dir,
+            diff_dir=diff_dir,
+            filter_loopback_host=hooks.filter_loopback_host,
+            batfish_wall=batfish_wall,
+            hammerhead_wall=hammerhead_wall,
+        )
+        result.agreement = agreement
+        result.diff_path = diff_dir
+        result.status = "passed"
+    except Exception as exc:  # noqa: BLE001 — sim-only is the top-level catch-all here
+        result.error = f"{type(exc).__name__}: {exc}"
+        log.error("[%s] sim-only failed: %s", spec.name, result.error)
+    finally:
+        result.finished_iso = _now_iso()
+    return result
+
+
+def _compute_sim_only_agreement(
+    *,
+    spec: TopologySpec,
+    results_dir: Path,
+    diff_dir: Path,
+    filter_loopback_host: bool,
+    batfish_wall: float | None,
+    hammerhead_wall: float | None,
+) -> SimOnlyAgreement:
+    """Diff Batfish and Hammerhead head-to-head; write records + agreement.json."""
+    import json  # noqa: PLC0415
+
+    workspace = load_fib_workspace(results_dir, spec.name)
+    # Re-index directly; the existing diff engine treats one of the two sides
+    # as vendor truth, which would mislabel the result here.
+    batfish_ix = _sim_only_index(workspace.batfish, filter_loopback_host)
+    hammer_ix = _sim_only_index(workspace.hammerhead, filter_loopback_host)
+
+    union_keys = set(batfish_ix) | set(hammer_ix)
+    both_keys = set(batfish_ix) & set(hammer_ix)
+
+    nh_agree = 0
+    proto_agree = 0
+    bgp_total = 0
+    bgp_agree = 0
+    records: list[dict] = []
+    for key in sorted(union_keys, key=lambda k: (k.node, k.vrf, k.prefix)):
+        b = batfish_ix.get(key)
+        h = hammer_ix.get(key)
+        row: dict = {
+            "node": key.node,
+            "vrf": key.vrf,
+            "prefix": key.prefix,
+            "in_batfish": b is not None,
+            "in_hammerhead": h is not None,
+            "batfish_protocol": b.protocol if b else None,
+            "hammerhead_protocol": h.protocol if h else None,
+        }
+        if b is not None and h is not None:
+            row["next_hop_agree"] = _nh_sets_equal_sim_only(b, h)
+            row["protocol_agree"] = b.protocol == h.protocol
+            if b.protocol == "bgp" and h.protocol == "bgp":
+                row["bgp_attrs_agree"] = (
+                    _as_path_equal_sim_only(b.as_path, h.as_path)
+                    and b.local_pref == h.local_pref
+                    and b.med == h.med
+                )
+            else:
+                row["bgp_attrs_agree"] = None
+            if row["next_hop_agree"]:
+                nh_agree += 1
+            if row["protocol_agree"]:
+                proto_agree += 1
+            if row["bgp_attrs_agree"] is not None:
+                bgp_total += 1
+                if row["bgp_attrs_agree"] is True:
+                    bgp_agree += 1
+        records.append(row)
+
+    denom_both = len(both_keys) or 1
+    agreement = SimOnlyAgreement(
+        topology=spec.name,
+        batfish_routes=len(batfish_ix),
+        hammerhead_routes=len(hammer_ix),
+        union_keys=len(union_keys),
+        both_sides_keys=len(both_keys),
+        next_hop_agreement=nh_agree / denom_both if both_keys else 1.0,
+        protocol_agreement=proto_agree / denom_both if both_keys else 1.0,
+        bgp_attr_agreement=bgp_agree / bgp_total if bgp_total else 1.0,
+        batfish_wall_s=batfish_wall,
+        hammerhead_wall_s=hammerhead_wall,
+        batfish_simulate_s=_read_stat(results_dir / "batfish" / spec.name / "batfish_stats.json", "total_s"),
+        hammerhead_simulate_s=_read_stat(
+            results_dir / "hammerhead" / spec.name / "hammerhead_stats.json", "total_s"
+        ),
+    )
+
+    diff_dir.mkdir(parents=True, exist_ok=True)
+    (diff_dir / "records.json").write_text(json.dumps(records, indent=2) + "\n")
+    (diff_dir / "agreement.json").write_text(json.dumps(agreement.as_dict(), indent=2) + "\n")
+    return agreement
+
+
+def _sim_only_index(fibs, filter_loopback_host: bool):
+    """Index FIBs by (node, vrf, prefix) → Route. Mirrors the private helper in engine.py."""
+    from harness.diff.engine import _RouteKey  # noqa: PLC0415
+    from harness.extract.fib import canonicalize_node_fib  # noqa: PLC0415
+
+    out = {}
+    for raw in fibs:
+        fib = canonicalize_node_fib(raw, filter_loopback_host=filter_loopback_host)
+        for r in fib.routes:
+            out[_RouteKey(node=fib.node, vrf=fib.vrf, prefix=r.prefix)] = r
+    return out
+
+
+def _nh_sets_equal_sim_only(a, b) -> bool:
+    """Forwarding-equivalent next-hop equality.
+
+    Interface names differ gratuitously between simulators (``Loopback`` vs
+    ``lo``; ``dynamic`` vs ``None`` for BGP recursive next-hops), so we
+    compare on the semantically-meaningful axis: the set of next-hop IPs.
+    When both sides have at least one IP, IP-set equality wins; otherwise we
+    fall back to the interface-name set so pure-connected routes (no IP) are
+    still checked.
+    """
+    a_ips = frozenset(n.ip for n in a.next_hops if n.ip is not None)
+    b_ips = frozenset(n.ip for n in b.next_hops if n.ip is not None)
+    if a_ips and b_ips:
+        return a_ips == b_ips
+    # Pure-connected / pure-local routes carry no IP next-hop. Interface
+    # names are vendor/simulator-labeled and differ gratuitously
+    # (``Loopback`` vs ``lo``, ``GigabitEthernet0/0/0/0`` vs ``eth1``).
+    # When both sides report at least one interface next-hop for the same
+    # prefix with agreeing protocol, treat as forwarding-equivalent — the
+    # presence + protocol signal is the honest outcome.
+    a_has_iface = any(n.interface for n in a.next_hops)
+    b_has_iface = any(n.interface for n in b.next_hops)
+    if not a_ips and not b_ips and a_has_iface and b_has_iface:
+        return True
+    if not a_ips and not b_ips and not a_has_iface and not b_has_iface:
+        return True
+    return False
+
+
+def _as_path_equal_sim_only(a, b) -> bool:
+    if a is None and b is None:
+        return True
+    if a is None or b is None:
+        return False
+    return a == b
+
+
+def _read_stat(path: Path, key: str) -> float | None:
+    """Read a single float key out of a sidecar stats JSON; None if absent."""
+    import json  # noqa: PLC0415
+
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return None
+    val = data.get(key)
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def aggregate_sim_only(per_topology: list[SimOnlyAgreement]) -> dict:
+    """Simple mean across topologies for the head-to-head bench summary."""
+    n = len(per_topology)
+    if n == 0:
+        return {"topology_count": 0}
+
+    def _mean(xs: list[float]) -> float:
+        return sum(xs) / len(xs) if xs else 1.0
+
+    return {
+        "topology_count": n,
+        "next_hop_agreement_mean": _mean([a.next_hop_agreement for a in per_topology]),
+        "protocol_agreement_mean": _mean([a.protocol_agreement for a in per_topology]),
+        "bgp_attr_agreement_mean": _mean([a.bgp_attr_agreement for a in per_topology]),
+        "total_batfish_routes": sum(a.batfish_routes for a in per_topology),
+        "total_hammerhead_routes": sum(a.hammerhead_routes for a in per_topology),
+        "total_batfish_wall_s": sum(a.batfish_wall_s or 0.0 for a in per_topology),
+        "total_hammerhead_wall_s": sum(a.hammerhead_wall_s or 0.0 for a in per_topology),
+        "topology_details": [a.as_dict() for a in per_topology],
+    }

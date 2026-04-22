@@ -133,12 +133,11 @@ class SubprocessHammerheadRunner:
             [
                 cfg.hammerhead_cli,
                 "rib",
-                "--config-dir",
-                str(configs_dir),
                 "--device",
                 device,
                 "--format",
                 "json",
+                str(configs_dir),
             ],
             cfg.timeout_s,
         )

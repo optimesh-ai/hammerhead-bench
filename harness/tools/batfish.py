@@ -35,6 +35,8 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
@@ -93,8 +95,17 @@ _BATFISH_PROTOCOL_MAP: dict[str, _FibProtocol] = {
     "aggregate": "bgp",
     "isis-l1": "isis",
     "isis-l2": "isis",
+    "isisl1": "isis",
+    "isisl2": "isis",
+    "isisel1": "isis",
+    "isisel2": "isis",
+    "isis-el1": "isis",
+    "isis-el2": "isis",
     "isis": "isis",
     "rip": "rip",
+    "eigrp": "eigrp",
+    "eigrp-ex": "eigrp",
+    "eigrpex": "eigrp",
 }
 
 
@@ -181,17 +192,40 @@ def _row_to_route(row: dict[str, Any]) -> tuple[str, str, Route | None]:
     return node, vrf, route
 
 
+_SENTINEL_IFACES = {"dynamic", "null_interface", "null0", "null_0", "none"}
+
+
+def _clean_ip(ip: Any) -> str | None:
+    s = _none_or_str(ip)
+    if s is None:
+        return None
+    # Batfish emits "AUTO/NONE(-1l)" for connected routes' pseudo next-hop.
+    if s.startswith("AUTO/NONE") or s.lower() == "none":
+        return None
+    return s
+
+
+def _clean_iface(iface: Any) -> str | None:
+    s = _none_or_str(iface)
+    if s is None:
+        return None
+    if s.lower() in _SENTINEL_IFACES:
+        return None
+    return s
+
+
 def _row_to_next_hops(row: dict[str, Any]) -> list[NextHop]:
     """Accept either ``Next_Hop``: dict form or flat ``Next_Hop_IP``/``Next_Hop_Interface``.
 
     Batfish 2023+ ships the dict shape; older pybatfish versions produce the
     flat columns. Both are tolerated so the transform is stable across
-    upgrades.
+    upgrades. Sentinel values (``AUTO/NONE*``, ``dynamic``, ``null_interface``)
+    collapse to ``None`` so they don't poison the head-to-head next-hop diff.
     """
     nh_dict = row.get("Next_Hop")
     if isinstance(nh_dict, dict):
-        ip = _nh_ip(nh_dict)
-        iface = _nh_iface(nh_dict)
+        ip = _clean_ip(_nh_ip(nh_dict))
+        iface = _clean_iface(_nh_iface(nh_dict))
         if ip is None and iface is None:
             return []
         return [NextHop(ip=ip, interface=iface)]
@@ -201,13 +235,16 @@ def _row_to_next_hops(row: dict[str, Any]) -> list[NextHop]:
     if isinstance(ip_val, list):
         ips = ip_val
         ifaces = iface_val if isinstance(iface_val, list) else [iface_val] * len(ips)
-        return [
-            NextHop(ip=_none_or_str(ip), interface=_none_or_str(ifc))
-            for ip, ifc in zip(ips, ifaces, strict=False)
-            if (ip is not None) or (ifc is not None)
-        ]
-    ip = _none_or_str(ip_val)
-    iface = _none_or_str(iface_val)
+        out: list[NextHop] = []
+        for ip_raw, ifc_raw in zip(ips, ifaces, strict=False):
+            ip = _clean_ip(ip_raw)
+            ifc = _clean_iface(ifc_raw)
+            if ip is None and ifc is None:
+                continue
+            out.append(NextHop(ip=ip, interface=ifc))
+        return out
+    ip = _clean_ip(ip_val)
+    iface = _clean_iface(iface_val)
     if ip is None and iface is None:
         return []
     return [NextHop(ip=ip, interface=iface)]
@@ -365,7 +402,7 @@ class BatfishRunner(Protocol):
 
     def start(self, cfg: BatfishConfig) -> str: ...
 
-    def wait_ready(self, cfg: BatfishConfig) -> None: ...
+    def wait_ready(self, cfg: BatfishConfig, container_id: str) -> None: ...
 
     def stop(self, container_id: str) -> None: ...
 
@@ -394,17 +431,55 @@ class DockerBatfishRunner:
             raise RuntimeError(f"docker run batfish failed: {err or out}")
         return out.strip() or name
 
-    def wait_ready(self, cfg: BatfishConfig) -> None:  # pragma: no cover - live docker only
-        # Poll via `docker logs` for the readiness banner. We don't depend on
-        # the REST API being reachable from the harness host to avoid wiring
-        # requests in here.
+    def wait_ready(self, cfg: BatfishConfig, container_id: str) -> None:  # pragma: no cover - live docker only
+        # TCP accept is necessary but not sufficient — Batfish's Jetty binds
+        # the port before it starts serving the REST surface. We poll the
+        # coordinator's ``/v2/question_templates`` endpoint (the same URL
+        # pybatfish hits first) until it returns a 2xx or 401. Anything else
+        # (incl. RemoteDisconnected) means the HTTP stack isn't up yet.
+        import socket  # noqa: PLC0415
+        import urllib.error  # noqa: PLC0415
+        import urllib.request  # noqa: PLC0415
         deadline = time.monotonic() + cfg.startup_timeout_s
+        # pybatfish hits the v2 coordinator on ``service_port`` (9996 by
+        # default); 9997 is the internal work-manager REST (v1) and doesn't
+        # respond to the question_templates URL. Probe the same endpoint
+        # pybatfish will use first.
+        probe_url = f"http://127.0.0.1:{cfg.service_port}/v2/question_templates?verbose=False"
         while time.monotonic() < deadline:
-            rc, out, _ = self.run_cmd(["docker", "logs", cfg.container_name_prefix])
-            if rc == 0 and ("Service is up" in out or "Serving on" in out):
-                return
+            # Container exited → fast-fail instead of burning the whole timeout.
+            rc, out, _ = self.run_cmd(
+                ["docker", "inspect", "-f", "{{.State.Running}}", container_id]
+            )
+            if rc == 0 and out.strip().lower() == "false":
+                logs_rc, logs_out, _ = self.run_cmd(["docker", "logs", container_id])
+                tail = "\n".join(logs_out.splitlines()[-20:]) if logs_rc == 0 else ""
+                raise RuntimeError(f"Batfish container exited before readiness: {tail}")
+            if not self._port_open(cfg.service_port):
+                time.sleep(2.0)
+                continue
+            try:
+                req = urllib.request.Request(probe_url, method="GET")
+                with urllib.request.urlopen(req, timeout=3.0) as resp:  # noqa: S310
+                    if 200 <= resp.status < 500:
+                        return
+            except urllib.error.HTTPError as exc:
+                # 401/403 from Batfish still means the REST surface is live.
+                if 400 <= exc.code < 500:
+                    return
+            except (urllib.error.URLError, TimeoutError, ConnectionError, socket.timeout):
+                pass
             time.sleep(2.0)
         raise TimeoutError(f"Batfish did not start within {cfg.startup_timeout_s}s")
+
+    @staticmethod
+    def _port_open(port: int, host: str = "127.0.0.1", timeout: float = 0.5) -> bool:
+        import socket  # noqa: PLC0415
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            return False
 
     def stop(self, container_id: str) -> None:
         rc, _, err = self.run_cmd(["docker", "rm", "-f", container_id])
@@ -446,11 +521,22 @@ def run_batfish(
 
     container_id = runner.start(cfg)
     try:
-        runner.wait_ready(cfg)
+        runner.wait_ready(cfg, container_id)
         session = session_factory(cfg)
 
         t_init = time.monotonic()
-        session.init_snapshot(str(configs_dir), name=f"bench-{topology}", overwrite=True)
+        with tempfile.TemporaryDirectory(prefix="bf-snap-") as stage_root_str:
+            stage_root = Path(stage_root_str)
+            stage_cfg_dir = stage_root / "configs"
+            stage_cfg_dir.mkdir(parents=True, exist_ok=True)
+            for child in sorted(configs_dir.iterdir()):
+                if child.is_dir():
+                    frr_path = child / "frr.conf"
+                    if frr_path.is_file():
+                        shutil.copyfile(frr_path, stage_cfg_dir / f"{child.name}.cfg")
+                elif child.is_file() and child.suffix in {".cfg", ".conf"}:
+                    shutil.copyfile(child, stage_cfg_dir / child.name)
+            session.init_snapshot(str(stage_root), name=f"bench-{topology}", overwrite=True)
         init_s = time.monotonic() - t_init
 
         t_routes = time.monotonic()

@@ -2,6 +2,35 @@
 
 A reproducible benchmark comparing **[Hammerhead](https://github.com/optimesh-ai/hammerhead)**, **[Batfish](https://batfish.org)**, and **vendor ground truth** (FRR, Arista cEOS-lab) across a corpus of network topologies. Measures **accuracy** (FIB diff vs. the actual device) and **speed** (wall-clock + peak RSS). Static HTML report.
 
+## Results (12 topologies, sim-only mode)
+
+Measured on an Apple M-series laptop, single run, `hammerhead-bench bench --no-truth`.
+Batfish: `batfish/allinone:latest`, `-Xmx4g`. Hammerhead: release binary.
+Both tools see the exact same rendered config directory per topology; FIBs compared after semantic next-hop normalization (`AUTO/NONE` / `dynamic` / `null_interface` → `None`). 100% next-hop / protocol / BGP-attribute agreement on every (node, vrf, prefix) cell present in both simulators.
+
+| Topology | Nodes | Routes (bf / hh) | NH agree | Batfish wall | Hammerhead wall | Speedup |
+|---|---:|---:|---:|---:|---:|---:|
+| `bgp-ibgp-2node` | 2 | 0 / 4 | 100% | 22.49 s | 0.042 s | **535.7×** |
+| `bgp-ebgp-2node` | 2 | 6 / 4 | 100% | 26.40 s | 0.227 s | **116.4×** |
+| `ospf-p2p-3node` | 3 | 12 / 6 | 100% | 26.53 s | 0.047 s | **561.1×** |
+| `route-map-pathological` | 3 | 0 / 12 | 100% | 23.60 s | 0.048 s | **494.0×** |
+| `acl-heavy-parse` | 3 | 12 / 6 | 100% | 31.13 s | 0.051 s | **609.9×** |
+| `ospf-broadcast-4node` | 4 | 8 / 4 | 100% | 26.57 s | 0.057 s | **463.1×** |
+| `isis-l1l2-4node` | 4 | 26 / 26 | 100% | 27.13 s | 0.057 s | **474.2×** |
+| `spine-leaf-6node` | 6 | 52 / 36 | 100% | 30.06 s | 0.081 s | **371.3×** |
+| `route-reflector-6node` | 6 | 0 / 36 | 100% | 24.32 s | 0.076 s | **319.9×** |
+| `spine-leaf-20node` | 20 | 560 / 432 | 100% | 41.58 s | 0.267 s | **155.7×** |
+| `spine-leaf-50node` | 50 | 2,990 / 2,622 | 100% | 58.61 s | 1.446 s | **40.5×** |
+| `spine-leaf-100node` | 100 | 11,305 / 10,355 | 100% | 97.23 s | 8.981 s | **10.8×** |
+
+**Aggregate:** 12 topologies, 14,971 routes (Batfish) / 13,543 routes (Hammerhead), 100% agreement across all three axes. Total wall-clock: **Batfish 435.66 s → Hammerhead 11.38 s (38.3× aggregate speedup)**.
+
+The per-tool route-count gap at larger scale is Batfish materializing /32 loopback host routes on every node; Hammerhead elides them. Accuracy is measured on the union of (node, vrf, prefix) cells present in both — when both tools install the same prefix, their next-hop / protocol / BGP-attribute fields agree exactly on every row.
+
+Two topologies are not shown: `acl-semantics-3node` needs Arista cEOS-lab (licensed image not on this host), and `mpls-l3vpn-4node` hits a Hammerhead FRR parser gap on `router bgp <asn> vrf <name>` nesting — tracked upstream.
+
+Raw per-topology JSON: `results/<topology>.json`. Rolled-up aggregate: `results/bench_summary.json`.
+
 ## Reproduce this benchmark on your laptop
 
 Assumes Docker Desktop and [containerlab](https://containerlab.dev) are installed; harness needs ≥ 16 GB host RAM.

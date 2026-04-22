@@ -21,7 +21,14 @@ from pathlib import Path
 import click
 
 from harness.diff.metrics import TopologyMetrics, aggregate_many
-from harness.pipeline import BenchHooks, run_topology
+from harness.pipeline import (
+    BenchHooks,
+    SimOnlyAgreement,
+    SimOnlyResult,
+    aggregate_sim_only,
+    run_topology,
+    run_topology_sim_only,
+)
 from harness.tools.batfish import run_batfish
 from harness.tools.hammerhead import run_hammerhead
 from harness.topology import TopologySpec, load_spec
@@ -185,6 +192,16 @@ def _print_result(result) -> None:
     help="Leave dangling containers on a failed topology for manual debugging.",
 )
 @click.option(
+    "--sim-only",
+    is_flag=True,
+    help=(
+        "Skip containerlab deploy and vendor-truth extraction. Run Batfish + "
+        "Hammerhead head-to-head on the rendered configs only. Works on any "
+        "Docker-capable host (including macOS); the 3-way vendor path requires "
+        "Linux containerlab."
+    ),
+)
+@click.option(
     "-v",
     "--verbose",
     is_flag=True,
@@ -199,6 +216,7 @@ def bench(
     no_batfish: bool,
     no_hammerhead: bool,
     keep_lab_on_failure: bool,
+    sim_only: bool,
     verbose: bool,
 ) -> None:
     """Iterate every topology under ./topologies/ and collect metrics.
@@ -233,6 +251,10 @@ def bench(
         batfish=None if no_batfish else _default_batfish_hook,
         hammerhead=None if no_hammerhead else _default_hammerhead_hook,
     )
+
+    if sim_only:
+        _run_bench_sim_only(selected, hooks=hooks, results_dir=results_dir)
+        return
 
     results: list = []
     per_topology_metrics: list[TopologyMetrics] = []
@@ -269,6 +291,106 @@ def bench(
         f"summary -> {results_dir / 'bench_summary.json'}"
     )
     sys.exit(0 if not failed else 1)
+
+
+def _run_bench_sim_only(
+    selected: list[TopologySpec],
+    *,
+    hooks: BenchHooks,
+    results_dir: Path,
+) -> None:
+    """Sim-only bench loop: no clab, no vendor truth — Batfish vs Hammerhead only."""
+    results: list[SimOnlyResult] = []
+    agreements: list[SimOnlyAgreement] = []
+    failed: list[str] = []
+
+    for spec in selected:
+        workdir = results_dir / "workdir" / spec.name
+        click.echo(f"[bench sim-only] topology={spec.name}")
+        try:
+            result = run_topology_sim_only(
+                spec,
+                workdir=workdir,
+                results_dir=results_dir,
+                hooks=hooks,
+            )
+        except Exception as exc:  # noqa: BLE001 — bench catch-all
+            click.echo(
+                f"[bench sim-only] {spec.name}: {type(exc).__name__}: {exc}",
+                err=True,
+            )
+            failed.append(spec.name)
+            continue
+        results.append(result)
+        _write_sim_only_result(result, results_dir)
+        _print_sim_only_result(result)
+        if result.status != "passed":
+            failed.append(spec.name)
+        if result.agreement is not None:
+            agreements.append(result.agreement)
+
+    summary = aggregate_sim_only(agreements)
+    summary["failed_topologies"] = failed
+    summary["mode"] = "sim_only"
+    (results_dir / "bench_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    click.echo(
+        f"[bench sim-only] done. {len(selected) - len(failed)}/{len(selected)} passed. "
+        f"summary -> {results_dir / 'bench_summary.json'}"
+    )
+    sys.exit(0 if not failed else 1)
+
+
+def _write_sim_only_result(result: SimOnlyResult, results_dir: Path) -> None:
+    """Write a per-topology sim-only run result to ``<results_dir>/<topology>.json``.
+
+    Shape diverges from the 3-way vendor-truth result so the report loader can
+    distinguish the two modes by the presence of ``agreement`` vs ``metrics``.
+    Paths are written relative to ``results_dir`` so committed artifacts
+    don't leak operator filesystem layout.
+    """
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    def _rel(p: Path | None) -> str | None:
+        if p is None:
+            return None
+        try:
+            return str(Path(p).resolve().relative_to(results_dir.resolve()))
+        except ValueError:
+            return str(p)
+
+    payload = {
+        "topology": result.topology,
+        "status": result.status,
+        "mode": "sim_only",
+        "started_iso": result.started_iso,
+        "finished_iso": result.finished_iso,
+        "batfish_path": _rel(result.batfish_path),
+        "hammerhead_path": _rel(result.hammerhead_path),
+        "diff_path": _rel(result.diff_path),
+        "agreement": result.agreement.as_dict() if result.agreement else None,
+        "error": result.error,
+        "notes": result.notes,
+    }
+    (results_dir / f"{result.topology}.json").write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def _print_sim_only_result(result: SimOnlyResult) -> None:
+    status_word = result.status.upper()
+    color = {"PASSED": "green", "FAILED": "red"}.get(status_word, "white")
+    click.echo(click.style(f"[{status_word}] {result.topology}", fg=color, bold=True))
+    if result.error:
+        click.echo(f"  error: {result.error}")
+    if result.agreement is not None:
+        a = result.agreement
+        click.echo(
+            f"  batfish={a.batfish_routes} routes, hammerhead={a.hammerhead_routes} routes, "
+            f"nh_agree={a.next_hop_agreement:.1%}, proto_agree={a.protocol_agreement:.1%}, "
+            f"bgp_attr_agree={a.bgp_attr_agreement:.1%}"
+        )
+        if a.batfish_wall_s is not None and a.hammerhead_wall_s is not None:
+            click.echo(
+                f"  wall: batfish={a.batfish_wall_s:.2f}s, hammerhead={a.hammerhead_wall_s:.2f}s"
+            )
 
 
 @main.command()

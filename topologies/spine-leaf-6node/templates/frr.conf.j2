@@ -30,7 +30,7 @@ router bgp {{ params.asn }}
 {% endif %}
  !
  address-family ipv4 unicast
-  maximum-paths 2
+  maximum-paths {{ params.ecmp_paths | default(2) }}
 {% if params.role == "leaf" %}
   network {{ params.loopback }}/32
 {% for peer in params.spine_peers %}

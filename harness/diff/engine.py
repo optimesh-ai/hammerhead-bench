@@ -281,5 +281,9 @@ def _load_dir(dirpath: Path) -> list[NodeFib]:
         return []
     fibs: list[NodeFib] = []
     for p in sorted(dirpath.glob("*.json")):
+        # Skip per-tool stats sidecars (e.g. ``batfish_stats.json``,
+        # ``hammerhead_stats.json``) that live in the same directory.
+        if p.name.endswith("_stats.json"):
+            continue
         fibs.append(NodeFib.model_validate_json(p.read_text()))
     return fibs
