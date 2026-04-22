@@ -72,22 +72,29 @@ by Batfish and Hammerhead respectively, each route identified by
 its key `(n, v, p)` ∈ Nodes × VRFs × Prefixes. We measure
 agreement only on `B ∩ H` — cells where both simulators installed
 some route for the same key on the same node in the same VRF.
-For each such cell, we define:
+For each such cell, we define (exactly as implemented in
+`harness/diff/engine.py`):
 
-- **`nh_agree(n, v, p)`** — let `NH_t(n,v,p)` be the next-hop
-  multiset produced by tool `t` at cell `(n,v,p)` after
-  canonicalization (AUTO/NONE/dynamic/null_interface → None).
-  `nh_agree := (IP-set of NH_B == IP-set of NH_H)` when either
-  side has ≥ 1 IP next-hop; otherwise `(interface-set of NH_B
-  == interface-set of NH_H)`.
+- **`nh_agree(n, v, p)`** — let `NH_t(n,v,p) = {(ip_i, iface_i)}`
+  be the *set* of `(ip, interface)` pairs produced by tool `t` at
+  cell `(n,v,p)` after canonicalization. Canonicalization collapses
+  the Batfish sentinels `AUTO/NONE*`, `dynamic`, `null_interface`,
+  `null0`, `null_0`, `none` to the Python `None` value, so a
+  syntactic difference between the two tools' descriptors of
+  "no next-hop IP" / "null interface" does not manufacture a
+  disagreement. Then `nh_agree := NH_B == NH_H` as
+  `frozenset` equality.
 - **`proto_agree(n, v, p)`** — `protocol(B) == protocol(H)` as
-  a string equality on canonicalized protocol names
-  (`bgp`, `ospf`, `ospf_ia`, `ospf_e1`, `ospf_e2`, `isis_l1`,
-  `isis_l2`, `static`, `connected`).
+  a string equality on the canonicalized protocol code emitted
+  by the respective harness adapter (`bgp`, `ospf`, `isis`,
+  `static`, `connected`, etc.).
 - **`bgp_attrs_agree(n, v, p)`** — defined only on cells where
-  both sides report protocol `bgp`. Let `a(t) := (AS_PATH,
-  LOCAL_PREF, MED)` for tool `t`; then
-  `bgp_attrs_agree := a(B) == a(H)` as a tuple.
+  both sides report protocol `bgp`. Let
+  `a(t) := (AS_PATH, LOCAL_PREF, MED)` for tool `t`; then
+  `bgp_attrs_agree := (AS_PATH(B) == AS_PATH(H)) ∧
+  (LOCAL_PREF(B) == LOCAL_PREF(H)) ∧ (MED(B) == MED(H))`. The
+  `AS_PATH` comparison is length- and order-sensitive list
+  equality; `None` matches `None` but `None` does not match `[]`.
 
 Per-topology agreement is the unweighted cell-level mean of each
 relation over `B ∩ H` (over BGP-cells for `bgp_attrs_agree`).
