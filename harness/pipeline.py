@@ -393,6 +393,17 @@ class SimOnlyAgreement:
     ``(node, vrf, prefix)``. "Agreement" means both sides agree on a
     field; it is explicitly NOT a correctness claim because there's no
     third-party oracle.
+
+    When the bench runs with ``--trials N > 1``, the four wall-clock /
+    simulate-time scalars collapse to the **mean** across trials, and
+    two companion fields carry the raw measurements + summary stats:
+
+    * ``trials`` — ``{"n": N, "batfish_wall_s": [..], "hammerhead_wall_s": [..],
+      "batfish_simulate_s": [..], "hammerhead_simulate_s": [..]}``.
+    * ``trial_stats`` — per-timing ``{mean, std, min, max}``.
+
+    At ``trials == 1`` both fields are ``None`` and the scalar semantics
+    match the pre-trials shape byte-for-byte (no consumer break).
     """
 
     topology: str
@@ -407,6 +418,8 @@ class SimOnlyAgreement:
     hammerhead_wall_s: float | None = None
     batfish_simulate_s: float | None = None
     hammerhead_simulate_s: float | None = None
+    trials: dict | None = None
+    trial_stats: dict | None = None
 
     @property
     def coverage(self) -> float:
@@ -452,6 +465,7 @@ def run_topology_sim_only(
     workdir: Path,
     results_dir: Path,
     hooks: BenchHooks | None = None,
+    trials: int = 1,
 ) -> SimOnlyResult:
     """Render configs, run Batfish + Hammerhead, diff them head-to-head.
 
@@ -465,8 +479,19 @@ def run_topology_sim_only(
     ``hooks.batfish`` and ``hooks.hammerhead`` are required. An unset hook
     makes the pipeline write an empty FIB dir for that side; the agreement
     metrics handle that gracefully (presence goes to zero).
+
+    ``trials`` controls how many times each simulator hook fires. Rendering
+    is deterministic so it runs once; only the hook invocations (and their
+    sidecar stats) are repeated. Agreement is computed from the final
+    trial's FIB output (all trials must produce identical routes or the
+    simulator is non-deterministic — a separate concern). Per-trial wall
+    + ``*_simulate_s`` timings are collected into ``agreement.trials`` and
+    summarised to ``mean/std/min/max`` in ``agreement.trial_stats``.
     """
     import time as _time  # noqa: PLC0415
+
+    if trials < 1:
+        raise ValueError(f"trials must be >= 1, got {trials}")
 
     started = _now_iso()
     bf_dir = results_dir / "batfish" / spec.name
@@ -481,35 +506,54 @@ def run_topology_sim_only(
     )
 
     try:
-        log.info("[%s] rendering configs to %s (sim-only)", spec.name, workdir)
+        log.info(
+            "[%s] rendering configs to %s (sim-only, trials=%d)",
+            spec.name,
+            workdir,
+            trials,
+        )
         render_topology(spec, workdir)
         configs_dir = workdir / "configs"
 
-        batfish_wall: float | None = None
-        if hooks.batfish is not None:
-            log.info("[%s] running batfish", spec.name)
-            bf_dir.mkdir(parents=True, exist_ok=True)
-            t0 = _time.monotonic()
-            hooks.batfish(configs_dir, bf_dir, spec.name)
-            batfish_wall = _time.monotonic() - t0
-            result.batfish_path = bf_dir
+        batfish_walls: list[float] = []
+        batfish_sims: list[float] = []
+        hammer_walls: list[float] = []
+        hammer_sims: list[float] = []
 
-        hammerhead_wall: float | None = None
+        if hooks.batfish is not None:
+            bf_dir.mkdir(parents=True, exist_ok=True)
+            result.batfish_path = bf_dir
         if hooks.hammerhead is not None:
-            log.info("[%s] running hammerhead", spec.name)
             hh_dir.mkdir(parents=True, exist_ok=True)
-            t0 = _time.monotonic()
-            hooks.hammerhead(configs_dir, hh_dir, spec.name)
-            hammerhead_wall = _time.monotonic() - t0
             result.hammerhead_path = hh_dir
+
+        for i in range(trials):
+            if hooks.batfish is not None:
+                log.info("[%s] running batfish (trial %d/%d)", spec.name, i + 1, trials)
+                t0 = _time.monotonic()
+                hooks.batfish(configs_dir, bf_dir, spec.name)
+                batfish_walls.append(_time.monotonic() - t0)
+                sim_s = _read_stat(bf_dir / "batfish_stats.json", "total_s")
+                if sim_s is not None:
+                    batfish_sims.append(sim_s)
+            if hooks.hammerhead is not None:
+                log.info("[%s] running hammerhead (trial %d/%d)", spec.name, i + 1, trials)
+                t0 = _time.monotonic()
+                hooks.hammerhead(configs_dir, hh_dir, spec.name)
+                hammer_walls.append(_time.monotonic() - t0)
+                sim_s = _read_stat(hh_dir / "hammerhead_stats.json", "total_s")
+                if sim_s is not None:
+                    hammer_sims.append(sim_s)
 
         agreement = _compute_sim_only_agreement(
             spec=spec,
             results_dir=results_dir,
             diff_dir=diff_dir,
             filter_loopback_host=hooks.filter_loopback_host,
-            batfish_wall=batfish_wall,
-            hammerhead_wall=hammerhead_wall,
+            batfish_walls=batfish_walls,
+            hammerhead_walls=hammer_walls,
+            batfish_sims=batfish_sims,
+            hammerhead_sims=hammer_sims,
         )
         result.agreement = agreement
         result.diff_path = diff_dir
@@ -528,10 +572,18 @@ def _compute_sim_only_agreement(
     results_dir: Path,
     diff_dir: Path,
     filter_loopback_host: bool,
-    batfish_wall: float | None,
-    hammerhead_wall: float | None,
+    batfish_walls: list[float],
+    hammerhead_walls: list[float],
+    batfish_sims: list[float],
+    hammerhead_sims: list[float],
 ) -> SimOnlyAgreement:
-    """Diff Batfish and Hammerhead head-to-head; write records + agreement.json."""
+    """Diff Batfish and Hammerhead head-to-head; write records + agreement.json.
+
+    ``batfish_walls`` etc. hold per-trial measurements; each scalar field on
+    the returned :class:`SimOnlyAgreement` is the arithmetic mean across
+    the list, with the raw values + summary stats preserved under
+    ``trials`` / ``trial_stats``.
+    """
     import json  # noqa: PLC0415
 
     workspace = load_fib_workspace(results_dir, spec.name)
@@ -582,6 +634,38 @@ def _compute_sim_only_agreement(
         records.append(row)
 
     denom_both = len(both_keys) or 1
+
+    bf_wall_mean = _mean_or_none(batfish_walls)
+    hh_wall_mean = _mean_or_none(hammerhead_walls)
+    bf_sim_mean = _mean_or_none(batfish_sims)
+    hh_sim_mean = _mean_or_none(hammerhead_sims)
+
+    trials_payload: dict | None = None
+    stats_payload: dict | None = None
+    # Only surface the richer shape when at least one side saw repeated
+    # trials — keeps trials=1 bench_summary.json byte-for-byte compatible
+    # with the pre-trials consumer.
+    n_trials = max(
+        len(batfish_walls),
+        len(hammerhead_walls),
+        len(batfish_sims),
+        len(hammerhead_sims),
+    )
+    if n_trials >= 2:
+        trials_payload = {
+            "n": n_trials,
+            "batfish_wall_s": list(batfish_walls),
+            "hammerhead_wall_s": list(hammerhead_walls),
+            "batfish_simulate_s": list(batfish_sims),
+            "hammerhead_simulate_s": list(hammerhead_sims),
+        }
+        stats_payload = {
+            "batfish_wall_s": _summarize_timings(batfish_walls),
+            "hammerhead_wall_s": _summarize_timings(hammerhead_walls),
+            "batfish_simulate_s": _summarize_timings(batfish_sims),
+            "hammerhead_simulate_s": _summarize_timings(hammerhead_sims),
+        }
+
     agreement = SimOnlyAgreement(
         topology=spec.name,
         batfish_routes=len(batfish_ix),
@@ -591,18 +675,47 @@ def _compute_sim_only_agreement(
         next_hop_agreement=nh_agree / denom_both if both_keys else 1.0,
         protocol_agreement=proto_agree / denom_both if both_keys else 1.0,
         bgp_attr_agreement=bgp_agree / bgp_total if bgp_total else 1.0,
-        batfish_wall_s=batfish_wall,
-        hammerhead_wall_s=hammerhead_wall,
-        batfish_simulate_s=_read_stat(results_dir / "batfish" / spec.name / "batfish_stats.json", "total_s"),
-        hammerhead_simulate_s=_read_stat(
-            results_dir / "hammerhead" / spec.name / "hammerhead_stats.json", "total_s"
-        ),
+        batfish_wall_s=bf_wall_mean,
+        hammerhead_wall_s=hh_wall_mean,
+        batfish_simulate_s=bf_sim_mean,
+        hammerhead_simulate_s=hh_sim_mean,
+        trials=trials_payload,
+        trial_stats=stats_payload,
     )
 
     diff_dir.mkdir(parents=True, exist_ok=True)
     (diff_dir / "records.json").write_text(json.dumps(records, indent=2) + "\n")
     (diff_dir / "agreement.json").write_text(json.dumps(agreement.as_dict(), indent=2) + "\n")
     return agreement
+
+
+def _mean_or_none(xs: list[float]) -> float | None:
+    """Arithmetic mean of ``xs``; ``None`` for empty list (simulator skipped)."""
+    if not xs:
+        return None
+    return sum(xs) / len(xs)
+
+
+def _summarize_timings(xs: list[float]) -> dict[str, float] | None:
+    """``{mean, std, min, max}`` over ``xs`` (population stddev; 0.0 for len==1).
+
+    Returns ``None`` when ``xs`` is empty so the caller can distinguish
+    "simulator was skipped" from "simulator ran but produced no samples".
+    """
+    if not xs:
+        return None
+    import statistics  # noqa: PLC0415 — only needed on the trials path
+
+    mean = statistics.fmean(xs)
+    # Sample stddev (n-1) for trials >=2; 0.0 for single-trial so downstream
+    # "mean ± std" rendering doesn't NaN out.
+    std = statistics.stdev(xs) if len(xs) >= 2 else 0.0
+    return {
+        "mean": mean,
+        "std": std,
+        "min": min(xs),
+        "max": max(xs),
+    }
 
 
 def _sim_only_index(fibs, filter_loopback_host: bool):
@@ -704,9 +817,20 @@ def aggregate_sim_only(per_topology: list[SimOnlyAgreement]) -> dict:
 
     covered = [a for a in per_topology if a.both_sides_keys > 0]
 
+    # Trial count is uniform across topologies within a single bench run
+    # (CLI passes --trials N to every topology). Surface it at the summary
+    # level so the report can key off a single `trials` number.
+    trial_counts = {
+        (a.trials or {}).get("n", 1) for a in per_topology
+    }
+    trials_n = (
+        trial_counts.pop() if len(trial_counts) == 1 else max(trial_counts, default=1)
+    )
+
     return {
         "topology_count": n,
         "covered_topology_count": len(covered),
+        "trials": trials_n,
         "mean_coverage": _mean([a.coverage for a in per_topology]),
         "next_hop_agreement_mean": _mean([a.next_hop_agreement for a in per_topology]),
         "protocol_agreement_mean": _mean([a.protocol_agreement for a in per_topology]),

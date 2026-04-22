@@ -189,7 +189,9 @@ def _sim_only_per_topology_table(topologies: list[TopologyRow]) -> list[str]:
     """Per-topology agreement table for sim-only mode.
 
     Reads the ``agreement`` dict directly from each run — the with-truth
-    ``metrics`` field is always ``None`` in sim-only mode.
+    ``metrics`` field is always ``None`` in sim-only mode. When trials > 1,
+    the wall-clock columns render as ``mean ± std`` using the per-topology
+    ``agreement.trial_stats`` payload.
     """
     lines = ["## Per-topology"]
     if not topologies:
@@ -211,6 +213,15 @@ def _sim_only_per_topology_table(topologies: list[TopologyRow]) -> list[str]:
                 f"| {row.topology} | {status} | - | - | - | - | - | - | - | - | - | - |"
             )
             continue
+        trial_stats = agreement.get("trial_stats") or {}
+        bf_cell = _fmt_wall_with_std(
+            agreement.get("batfish_wall_s"),
+            trial_stats.get("batfish_wall_s"),
+        )
+        hh_cell = _fmt_wall_with_std(
+            agreement.get("hammerhead_wall_s"),
+            trial_stats.get("hammerhead_wall_s"),
+        )
         lines.append(
             f"| {row.topology} | {status} | "
             f"{agreement.get('batfish_routes', '-')} | "
@@ -221,8 +232,8 @@ def _sim_only_per_topology_table(topologies: list[TopologyRow]) -> list[str]:
             f"{_fmt_rate(agreement.get('next_hop_agreement'))} | "
             f"{_fmt_rate(agreement.get('protocol_agreement'))} | "
             f"{_fmt_rate(agreement.get('bgp_attr_agreement'))} | "
-            f"{_fmt_wall(agreement.get('batfish_wall_s'))} | "
-            f"{_fmt_wall(agreement.get('hammerhead_wall_s'))} |"
+            f"{bf_cell} | "
+            f"{hh_cell} |"
         )
     return lines
 
@@ -322,6 +333,21 @@ def _fmt_wall(s: float | None) -> str:
     if s is None:
         return "-"
     return f"{s:.2f}"
+
+
+def _fmt_wall_with_std(scalar: float | None, stats: dict | None) -> str:
+    """Render a wall-clock cell, preferring ``mean ± std`` when trials ran.
+
+    ``stats`` is the per-topology ``agreement.trial_stats[<field>]`` payload
+    (``{"mean": ..., "std": ..., "min": ..., "max": ...}``) produced when
+    ``--trials N`` runs N >= 2 trials. Falls back to the scalar mean field
+    for N == 1 runs (existing single-trial shape).
+    """
+    if stats is not None:
+        return f"{stats.get('mean', 0.0):.2f} ± {stats.get('std', 0.0):.2f}"
+    if scalar is None:
+        return "-"
+    return f"{scalar:.2f}"
 
 
 def _mean(xs: list[float]) -> float:

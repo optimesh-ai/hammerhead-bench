@@ -202,6 +202,20 @@ def _print_result(result) -> None:
     ),
 )
 @click.option(
+    "--trials",
+    type=int,
+    default=5,
+    show_default=True,
+    help=(
+        "Run each simulator hook N times per topology and record per-trial "
+        "wall-clocks + mean/std/min/max under results/<topology>.json "
+        "`agreement.trials` + `agreement.trial_stats`. Only the simulator "
+        "invocations repeat; rendering is deterministic so it runs once. "
+        "Currently honoured in --sim-only mode; the 3-way vendor path "
+        "(containerlab) always runs a single trial."
+    ),
+)
+@click.option(
     "-v",
     "--verbose",
     is_flag=True,
@@ -217,6 +231,7 @@ def bench(
     no_hammerhead: bool,
     keep_lab_on_failure: bool,
     sim_only: bool,
+    trials: int,
     verbose: bool,
 ) -> None:
     """Iterate every topology under ./topologies/ and collect metrics.
@@ -237,6 +252,17 @@ def bench(
     """
     _setup_logging(verbose)
 
+    if trials < 1:
+        click.echo(f"bench: --trials must be >= 1, got {trials}", err=True)
+        sys.exit(2)
+    if trials != 1 and not sim_only:
+        click.echo(
+            "bench: --trials N > 1 is only honoured with --sim-only; "
+            "the 3-way vendor path always runs a single trial.",
+            err=True,
+        )
+        sys.exit(2)
+
     selected = _select_topologies(
         only=set(only),
         skip=set(skip),
@@ -253,7 +279,9 @@ def bench(
     )
 
     if sim_only:
-        _run_bench_sim_only(selected, hooks=hooks, results_dir=results_dir)
+        _run_bench_sim_only(
+            selected, hooks=hooks, results_dir=results_dir, trials=trials
+        )
         return
 
     results: list = []
@@ -298,6 +326,7 @@ def _run_bench_sim_only(
     *,
     hooks: BenchHooks,
     results_dir: Path,
+    trials: int = 1,
 ) -> None:
     """Sim-only bench loop: no clab, no vendor truth — Batfish vs Hammerhead only."""
     results: list[SimOnlyResult] = []
@@ -306,13 +335,14 @@ def _run_bench_sim_only(
 
     for spec in selected:
         workdir = results_dir / "workdir" / spec.name
-        click.echo(f"[bench sim-only] topology={spec.name}")
+        click.echo(f"[bench sim-only trials={trials}] topology={spec.name}")
         try:
             result = run_topology_sim_only(
                 spec,
                 workdir=workdir,
                 results_dir=results_dir,
                 hooks=hooks,
+                trials=trials,
             )
         except Exception as exc:  # noqa: BLE001 — bench catch-all
             click.echo(
@@ -388,9 +418,20 @@ def _print_sim_only_result(result: SimOnlyResult) -> None:
             f"bgp_attr_agree={a.bgp_attr_agreement:.1%}"
         )
         if a.batfish_wall_s is not None and a.hammerhead_wall_s is not None:
-            click.echo(
-                f"  wall: batfish={a.batfish_wall_s:.2f}s, hammerhead={a.hammerhead_wall_s:.2f}s"
-            )
+            if a.trial_stats is not None:
+                bf = a.trial_stats.get("batfish_wall_s") or {}
+                hh = a.trial_stats.get("hammerhead_wall_s") or {}
+                n = (a.trials or {}).get("n", 1)
+                click.echo(
+                    f"  wall (n={n}): "
+                    f"batfish={bf.get('mean', 0.0):.2f}±{bf.get('std', 0.0):.2f}s, "
+                    f"hammerhead={hh.get('mean', 0.0):.3f}±{hh.get('std', 0.0):.3f}s"
+                )
+            else:
+                click.echo(
+                    f"  wall: batfish={a.batfish_wall_s:.2f}s, "
+                    f"hammerhead={a.hammerhead_wall_s:.2f}s"
+                )
 
 
 @main.command()
