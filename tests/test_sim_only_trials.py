@@ -60,6 +60,7 @@ class _CountingHook:
 
     source: str  # "batfish" | "hammerhead"
     simulate_s: float = 0.42
+    rib_total_s: float = 0.0
     calls: int = field(default=0)
 
     def __call__(self, configs_dir: Path, out_dir: Path, topology: str) -> None:  # noqa: ARG002
@@ -69,7 +70,21 @@ class _CountingHook:
             fib = _nodefib(node, self.source)
             (out_dir / f"{node}__{fib.vrf}.json").write_text(fib.model_dump_json())
         sidecar = out_dir / f"{self.source}_stats.json"
-        sidecar.write_text(json.dumps({"total_s": self.simulate_s}))
+        # Stamp simulate_s (the inner-solver field the pipeline now reads)
+        # equal to the test's configured scalar and total_s just slightly
+        # larger so the pipeline's simulate_s <= total_s guardrail is
+        # satisfied without making the mean math noisy. Hammerhead stats
+        # also carry ``rib_total_s`` — the per-device RIB materialisation
+        # cost that pairs with Batfish's ``query_routes + query_bgp`` in
+        # the fair solve+materialize ratio.
+        payload: dict[str, float] = {
+            "simulate_s": self.simulate_s,
+            "total_s": self.simulate_s + self.rib_total_s + 0.001,
+            "init_snapshot_s": 0.0,
+        }
+        if self.source == "hammerhead":
+            payload["rib_total_s"] = self.rib_total_s
+        sidecar.write_text(json.dumps(payload))
 
 
 def test_run_topology_sim_only_default_trials_has_no_trial_payload(tmp_path: Path) -> None:
@@ -171,6 +186,63 @@ def test_agreement_exposes_presence_and_solve_ratio(tmp_path: Path) -> None:
     assert a.solve_ratio() == pytest.approx(0.84 / 0.02)
 
 
+def test_agreement_exposes_fair_solve_plus_materialize_ratio(tmp_path: Path) -> None:
+    """Headline ratio is ``bf_simulate_s / (hh_simulate_s + hh_rib_total_s)``.
+    Pairs Batfish's fused query+materialize against Hammerhead's
+    simulate+rib subprocesses — the only apples-to-apples comparison."""
+    spec = load_spec(TOPO_DIR)
+    hooks = BenchHooks(
+        batfish=_CountingHook(source="batfish", simulate_s=0.90),
+        # HH: 0.02s in the simulator, 0.18s in the rib subprocess →
+        # fair denominator 0.20, asymmetric denominator 0.02.
+        hammerhead=_CountingHook(source="hammerhead", simulate_s=0.02, rib_total_s=0.18),
+    )
+    result = run_topology_sim_only(
+        spec,
+        workdir=tmp_path / "workdir",
+        results_dir=tmp_path / "results",
+        hooks=hooks,
+    )
+    a = result.agreement
+    assert a is not None
+    # Raw per-side fields.
+    assert a.hammerhead_rib_total_s == pytest.approx(0.18)
+    assert a.hammerhead_simulate_plus_rib_s == pytest.approx(0.20)
+    # Fair ratio is the headline; asymmetric ratio is retained as a lower
+    # bound. Fair < asymmetric because rib inflates HH's denominator.
+    assert a.solve_plus_materialize_ratio() == pytest.approx(0.90 / 0.20)  # 4.5x
+    assert a.solve_ratio() == pytest.approx(0.90 / 0.02)  # 45x (misleading)
+    d = a.as_dict()
+    assert d["solve_plus_materialize_ratio"] == pytest.approx(0.90 / 0.20)
+    assert d["solve_ratio"] == pytest.approx(0.90 / 0.02)
+    assert "hammerhead_rib_total_s" in d
+    assert "hammerhead_simulate_plus_rib_s" in d
+
+
+def test_solve_plus_materialize_ratio_returns_none_without_rib_stat() -> None:
+    """When the Hammerhead sidecar predates the rib_total_s field, the fair
+    ratio is None — never synthesise a fake denominator."""
+    from harness.pipeline import SimOnlyAgreement  # noqa: PLC0415
+
+    a = SimOnlyAgreement(
+        topology="legacy",
+        batfish_routes=4,
+        hammerhead_routes=4,
+        union_keys=4,
+        both_sides_keys=4,
+        next_hop_agreement=1.0,
+        protocol_agreement=1.0,
+        bgp_attr_agreement=1.0,
+        batfish_simulate_s=5.0,
+        hammerhead_simulate_s=0.05,
+        hammerhead_rib_total_s=None,
+        hammerhead_simulate_plus_rib_s=None,
+    )
+    assert a.solve_plus_materialize_ratio() is None
+    # Asymmetric ratio still renders so legacy sidecars aren't silently dropped.
+    assert a.solve_ratio() == pytest.approx(5.0 / 0.05)
+
+
 def test_solve_ratio_returns_none_when_simulate_stat_missing() -> None:
     from harness.pipeline import SimOnlyAgreement  # noqa: PLC0415
 
@@ -213,6 +285,123 @@ def test_run_topology_sim_only_rejects_trials_zero(tmp_path: Path) -> None:
             results_dir=tmp_path / "results",
             trials=0,
         )
+
+
+@dataclass
+class _SimulateExceedsTotalHook:
+    """Hook that stamps a sidecar where ``simulate_s > total_s + tolerance``.
+
+    Proves the pipeline's ``_assert_simulate_le_total`` guardrail fires
+    loudly at benchmark-time — the regression it's designed to catch is
+    a re-aliasing of ``simulate_s`` to any wall-clock stat.
+    """
+
+    source: str
+
+    def __call__(self, configs_dir: Path, out_dir: Path, topology: str) -> None:  # noqa: ARG002
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for node in ("r1", "r2"):
+            lo = "10.0.0.1" if node == "r1" else "10.0.0.2"
+            fib = NodeFib(
+                node=node,
+                vrf="default",
+                source=self.source,
+                routes=[
+                    Route(
+                        prefix=f"{lo}/32",
+                        protocol="connected",
+                        next_hops=[NextHop(interface="lo")],
+                        admin_distance=0,
+                        metric=0,
+                    ),
+                ],
+            )
+            (out_dir / f"{node}__{fib.vrf}.json").write_text(fib.model_dump_json())
+        (out_dir / f"{self.source}_stats.json").write_text(
+            # 10s simulate vs 1s total — classic re-aliasing regression shape.
+            json.dumps({"simulate_s": 10.0, "total_s": 1.0, "init_snapshot_s": 0.0})
+        )
+
+
+def test_pipeline_rejects_simulate_greater_than_total(tmp_path: Path) -> None:
+    """Guardrail: catch the 2026-04-22 regression where ``simulate_s`` was
+    aliased to ``total_s``. If a wrapper ever stamps a sidecar whose
+    ``simulate_s`` exceeds ``total_s`` by > 100 ms, the pipeline must
+    fail the topology rather than silently accept inflated solve ratios."""
+    spec = load_spec(TOPO_DIR)
+    hooks = BenchHooks(
+        batfish=_SimulateExceedsTotalHook(source="batfish"),
+        hammerhead=_SimulateExceedsTotalHook(source="hammerhead"),
+    )
+    result = run_topology_sim_only(
+        spec,
+        workdir=tmp_path / "workdir",
+        results_dir=tmp_path / "results",
+        hooks=hooks,
+    )
+    assert result.status == "failed"
+    assert result.error is not None
+    assert "simulate_s" in result.error
+    assert "total_s" in result.error
+
+
+def test_agreement_surfaces_init_snapshot_s(tmp_path: Path) -> None:
+    """``batfish_init_snapshot_s`` is the Batfish-only snapshot-upload cost.
+    Must land on :class:`SimOnlyAgreement` + in the JSON payload so the
+    report layer can separate "snapshot upload" from "real solve"."""
+    spec = load_spec(TOPO_DIR)
+
+    @dataclass
+    class _InitStampedHook:
+        source: str
+        simulate_s: float = 0.5
+        init_s: float = 7.3
+
+        def __call__(self, configs_dir: Path, out_dir: Path, topology: str) -> None:  # noqa: ARG002
+            out_dir.mkdir(parents=True, exist_ok=True)
+            for node in ("r1", "r2"):
+                lo = "10.0.0.1" if node == "r1" else "10.0.0.2"
+                fib = NodeFib(
+                    node=node,
+                    vrf="default",
+                    source=self.source,
+                    routes=[
+                        Route(
+                            prefix=f"{lo}/32",
+                            protocol="connected",
+                            next_hops=[NextHop(interface="lo")],
+                            admin_distance=0,
+                            metric=0,
+                        ),
+                    ],
+                )
+                (out_dir / f"{node}__{fib.vrf}.json").write_text(fib.model_dump_json())
+            (out_dir / f"{self.source}_stats.json").write_text(
+                json.dumps(
+                    {
+                        "simulate_s": self.simulate_s,
+                        "total_s": self.simulate_s + self.init_s + 0.5,
+                        "init_snapshot_s": self.init_s,
+                    }
+                )
+            )
+
+    hooks = BenchHooks(
+        batfish=_InitStampedHook(source="batfish", simulate_s=0.5, init_s=7.3),
+        # Hammerhead has no init_snapshot concept; the field stays None.
+        hammerhead=_InitStampedHook(source="hammerhead", simulate_s=0.05, init_s=0.0),
+    )
+    result = run_topology_sim_only(
+        spec,
+        workdir=tmp_path / "workdir",
+        results_dir=tmp_path / "results",
+        hooks=hooks,
+    )
+    assert result.status == "passed", result.error
+    a = result.agreement
+    assert a is not None
+    assert a.batfish_init_snapshot_s == pytest.approx(7.3)
+    assert "batfish_init_snapshot_s" in a.as_dict()
 
 
 def test_bench_cli_rejects_trials_without_sim_only(tmp_path: Path) -> None:

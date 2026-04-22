@@ -294,8 +294,15 @@ def test_run_batfish_writes_per_node_vrf_json(tmp_path: Path) -> None:
     # Stats look sane.
     assert stats.topology == "bgp-ibgp-2node"
     assert stats.total_s >= 0
+    # simulate_s is the inner solver (routes + bgp) and must never exceed
+    # the outer total_s — that invariant is the pipeline's runtime guardrail.
+    assert stats.simulate_s >= 0
+    assert stats.simulate_s <= stats.total_s + 0.001
+    assert stats.simulate_s == pytest.approx(stats.query_routes_s + stats.query_bgp_s)
     stats_payload = json.loads((out / "batfish_stats.json").read_text())
     assert stats_payload["topology"] == "bgp-ibgp-2node"
+    assert "simulate_s" in stats_payload
+    assert "init_snapshot_s" in stats_payload
 
 
 def test_run_batfish_stops_container_even_on_session_failure(tmp_path: Path) -> None:

@@ -374,13 +374,21 @@ class BatfishConfig:
 
 @dataclass(slots=True)
 class BatfishStats:
-    """Written alongside the FIB JSON so reports can surface per-topology timing."""
+    """Written alongside the FIB JSON so reports can surface per-topology timing.
+
+    ``simulate_s`` is the inner-solver wall-clock (``query_routes_s +
+    query_bgp_s``). It excludes docker startup, JVM / Jetty boot, and
+    ``init_snapshot`` upload. ``total_s`` is the outer wall-clock covering
+    everything from ``docker run`` through ``docker rm``. The gap
+    ``total_s - simulate_s - init_snapshot_s`` is the JVM/REST boot cost.
+    """
 
     topology: str
     started_iso: str
     init_snapshot_s: float
     query_routes_s: float
     query_bgp_s: float
+    simulate_s: float
     total_s: float
 
     def as_dict(self) -> dict:
@@ -689,6 +697,7 @@ def run_batfish(
         init_snapshot_s=init_s,
         query_routes_s=routes_s,
         query_bgp_s=bgp_s,
+        simulate_s=routes_s + bgp_s,
         total_s=time.monotonic() - t0,
     )
     (out_dir / "batfish_stats.json").write_text(json.dumps(stats.as_dict(), indent=2) + "\n")

@@ -163,7 +163,15 @@ class _StampingHook:
             )
             (out_dir / f"{name}__default.json").write_text(fib.model_dump_json())
         sidecar = out_dir / f"{self.source}_stats.json"
-        sidecar.write_text(json.dumps({"total_s": 0.12}))
+        payload: dict[str, float] = {
+            "simulate_s": 0.10,
+            "total_s": 0.12,
+            "init_snapshot_s": 0.0,
+        }
+        if self.source == "hammerhead":
+            payload["rib_total_s"] = 0.01
+            payload["total_s"] = 0.12  # sim 0.10 + rib 0.01 + slack 0.01 < 0.12
+        sidecar.write_text(json.dumps(payload))
 
 
 # ---- eligibility ---------------------------------------------------------

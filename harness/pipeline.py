@@ -418,6 +418,22 @@ class SimOnlyAgreement:
     hammerhead_wall_s: float | None = None
     batfish_simulate_s: float | None = None
     hammerhead_simulate_s: float | None = None
+    # Apples-to-apples counterpart to ``batfish_simulate_s`` on the Hammerhead
+    # side: time spent in ``hammerhead simulate`` plus ``hammerhead rib``
+    # (both subprocesses + canonical-FIB materialization). Batfish's
+    # ``query_routes_s + query_bgp_s`` already bundles dataflow with
+    # result serialization, so pairing it against ``hammerhead_simulate_s``
+    # alone understates Hammerhead's real denominator. The
+    # ``solve_plus_materialize_ratio()`` method uses this field; the older
+    # ``solve_ratio()`` method (which only uses ``hammerhead_simulate_s``)
+    # is retained as a documented Hammerhead-favoring lower bound.
+    hammerhead_rib_total_s: float | None = None
+    hammerhead_simulate_plus_rib_s: float | None = None
+    # Batfish-only architectural-cost breakdown: time spent uploading the
+    # rendered snapshot into the running Batfish container before any solve
+    # query fires. Hammerhead has no equivalent — it reads configs from
+    # disk directly — so the field is Batfish-side only.
+    batfish_init_snapshot_s: float | None = None
     trials: dict | None = None
     trial_stats: dict | None = None
 
@@ -455,18 +471,51 @@ class SimOnlyAgreement:
         return self.coverage
 
     def solve_ratio(self) -> float | None:
-        """``batfish_simulate_s / hammerhead_simulate_s`` — solver-only speedup.
+        """``batfish_simulate_s / hammerhead_simulate_s`` — asymmetric
+        Hammerhead-favoring lower bound; do **not** use as the headline.
 
-        None when either sidecar stat is missing or ``hammerhead_simulate_s``
-        is zero. This is the apples-to-apples ratio that excludes JVM
-        startup + pybatfish init from the Batfish numerator and
-        harness-fork-exec overhead from the Hammerhead denominator.
+        Batfish's ``query_routes_s + query_bgp_s`` numerator bundles
+        dataflow with result materialization (it's the entire
+        pybatfish REST round-trip). Hammerhead's ``simulate_s``
+        denominator is the ``hammerhead simulate`` subprocess **only**
+        — it does not include the ``hammerhead rib`` subprocess that
+        pybatfish's result-materialization step is analogous to.
+        Pairing them produces a ratio that flatters Hammerhead at
+        scale (the gap widens as the RIB grows). Use
+        :meth:`solve_plus_materialize_ratio` for the fair number.
+
+        None when either sidecar stat is missing or
+        ``hammerhead_simulate_s`` is zero.
         """
         if self.batfish_simulate_s is None or self.hammerhead_simulate_s is None:
             return None
         if self.hammerhead_simulate_s <= 0:
             return None
         return self.batfish_simulate_s / self.hammerhead_simulate_s
+
+    def solve_plus_materialize_ratio(self) -> float | None:
+        """``batfish_simulate_s / (hammerhead_simulate_s + hammerhead_rib_total_s)``.
+
+        The **headline** solver speedup: both sides include their inner
+        solver work **and** result materialization. On the Batfish side
+        pybatfish's ``query_routes`` / ``query_bgp`` is a fused
+        dataflow-plus-output call; the matching denominator on the
+        Hammerhead side is ``simulate`` (solver) + ``rib`` (per-device
+        RIB extraction + canonical-FIB write). Using this ratio as the
+        headline keeps the benchmark survivable under reviewer
+        scrutiny — every §1 cell is "equivalent work on each side,
+        wall-clock."
+
+        None when either the Batfish sidecar stat or the Hammerhead
+        combined denominator is missing or zero.
+        """
+        if self.batfish_simulate_s is None:
+            return None
+        if self.hammerhead_simulate_plus_rib_s is None:
+            return None
+        if self.hammerhead_simulate_plus_rib_s <= 0:
+            return None
+        return self.batfish_simulate_s / self.hammerhead_simulate_plus_rib_s
 
     def as_dict(self) -> dict:
         from dataclasses import asdict  # noqa: PLC0415
@@ -475,6 +524,7 @@ class SimOnlyAgreement:
         d["coverage"] = self.coverage
         d["presence"] = self.presence
         d["solve_ratio"] = self.solve_ratio()
+        d["solve_plus_materialize_ratio"] = self.solve_plus_materialize_ratio()
         return d
 
 
@@ -552,8 +602,10 @@ def run_topology_sim_only(
 
         batfish_walls: list[float] = []
         batfish_sims: list[float] = []
+        batfish_inits: list[float] = []
         hammer_walls: list[float] = []
         hammer_sims: list[float] = []
+        hammer_ribs: list[float] = []
 
         if hooks.batfish is not None:
             bf_dir.mkdir(parents=True, exist_ok=True)
@@ -567,18 +619,38 @@ def run_topology_sim_only(
                 log.info("[%s] running batfish (trial %d/%d)", spec.name, i + 1, trials)
                 t0 = _time.monotonic()
                 hooks.batfish(configs_dir, bf_dir, spec.name)
-                batfish_walls.append(_time.monotonic() - t0)
-                sim_s = _read_stat(bf_dir / "batfish_stats.json", "total_s")
+                wall = _time.monotonic() - t0
+                batfish_walls.append(wall)
+                sidecar = bf_dir / "batfish_stats.json"
+                sim_s = _read_stat(sidecar, "simulate_s")
+                init_s = _read_stat(sidecar, "init_snapshot_s")
+                total_s = _read_stat(sidecar, "total_s")
+                _assert_simulate_le_total("batfish", spec.name, sim_s, total_s)
                 if sim_s is not None:
                     batfish_sims.append(sim_s)
+                if init_s is not None:
+                    batfish_inits.append(init_s)
             if hooks.hammerhead is not None:
                 log.info("[%s] running hammerhead (trial %d/%d)", spec.name, i + 1, trials)
                 t0 = _time.monotonic()
                 hooks.hammerhead(configs_dir, hh_dir, spec.name)
-                hammer_walls.append(_time.monotonic() - t0)
-                sim_s = _read_stat(hh_dir / "hammerhead_stats.json", "total_s")
+                wall = _time.monotonic() - t0
+                hammer_walls.append(wall)
+                sidecar = hh_dir / "hammerhead_stats.json"
+                sim_s = _read_stat(sidecar, "simulate_s")
+                rib_s = _read_stat(sidecar, "rib_total_s")
+                total_s = _read_stat(sidecar, "total_s")
+                _assert_simulate_le_total("hammerhead", spec.name, sim_s, total_s)
+                _assert_simulate_le_total(
+                    "hammerhead (simulate+rib)",
+                    spec.name,
+                    (sim_s or 0.0) + (rib_s or 0.0) if sim_s is not None or rib_s is not None else None,
+                    total_s,
+                )
                 if sim_s is not None:
                     hammer_sims.append(sim_s)
+                if rib_s is not None:
+                    hammer_ribs.append(rib_s)
 
         agreement = _compute_sim_only_agreement(
             spec=spec,
@@ -589,6 +661,8 @@ def run_topology_sim_only(
             hammerhead_walls=hammer_walls,
             batfish_sims=batfish_sims,
             hammerhead_sims=hammer_sims,
+            batfish_inits=batfish_inits,
+            hammerhead_ribs=hammer_ribs,
         )
         result.agreement = agreement
         result.diff_path = diff_dir
@@ -611,6 +685,8 @@ def _compute_sim_only_agreement(
     hammerhead_walls: list[float],
     batfish_sims: list[float],
     hammerhead_sims: list[float],
+    batfish_inits: list[float] | None = None,
+    hammerhead_ribs: list[float] | None = None,
 ) -> SimOnlyAgreement:
     """Diff Batfish and Hammerhead head-to-head; write records + agreement.json.
 
@@ -674,6 +750,25 @@ def _compute_sim_only_agreement(
     hh_wall_mean = _mean_or_none(hammerhead_walls)
     bf_sim_mean = _mean_or_none(batfish_sims)
     hh_sim_mean = _mean_or_none(hammerhead_sims)
+    bf_init_mean = _mean_or_none(batfish_inits or [])
+    hh_rib_mean = _mean_or_none(hammerhead_ribs or [])
+    # Paired per-trial sum, meaned afterwards — keeps the denominator
+    # internally consistent when the two lists have different lengths
+    # (e.g. a sidecar lacks one of the keys). Falls back to the sum of
+    # means when pairing isn't possible.
+    hh_sim_plus_rib_mean: float | None
+    if hammerhead_sims and hammerhead_ribs and len(hammerhead_sims) == len(hammerhead_ribs):
+        hh_sim_plus_rib_mean = _mean_or_none(
+            [s + r for s, r in zip(hammerhead_sims, hammerhead_ribs, strict=True)]
+        )
+    elif hh_sim_mean is not None and hh_rib_mean is not None:
+        hh_sim_plus_rib_mean = hh_sim_mean + hh_rib_mean
+    elif hh_sim_mean is not None and hh_rib_mean is None:
+        # Legacy sidecar without rib_total_s — report simulate-only rather
+        # than synthesising a fake rib time.
+        hh_sim_plus_rib_mean = hh_sim_mean
+    else:
+        hh_sim_plus_rib_mean = None
 
     trials_payload: dict | None = None
     stats_payload: dict | None = None
@@ -714,6 +809,9 @@ def _compute_sim_only_agreement(
         hammerhead_wall_s=hh_wall_mean,
         batfish_simulate_s=bf_sim_mean,
         hammerhead_simulate_s=hh_sim_mean,
+        hammerhead_rib_total_s=hh_rib_mean,
+        hammerhead_simulate_plus_rib_s=hh_sim_plus_rib_mean,
+        batfish_init_snapshot_s=bf_init_mean,
         trials=trials_payload,
         trial_stats=stats_payload,
     )
@@ -822,6 +920,36 @@ def _read_stat(path: Path, key: str) -> float | None:
         return None
 
 
+# 100ms tolerance: measurement noise between the outer monotonic and the
+# inner sidecar stamp is single-digit ms on every host we've seen; anything
+# larger means ``simulate_s`` has been mis-aliased to a wall-clock stat
+# (the 2026-04-22 regression we just unwound). The check only fires when
+# both values are present so it doesn't trip on legacy sidecars without
+# a separate ``simulate_s`` key.
+_SIMULATE_LE_TOTAL_TOLERANCE_S = 0.1
+
+
+def _assert_simulate_le_total(
+    tool: str, topology: str, simulate_s: float | None, total_s: float | None
+) -> None:
+    """Guardrail: ``simulate_s`` must never exceed ``total_s`` by more than 100 ms.
+
+    A violation means the inner-solver field has been re-aliased to the
+    full wall-clock — the exact bug we just fixed. Raises ``RuntimeError``
+    at benchmark-time instead of waiting for a reviewer to notice that
+    "wall ≈ solve" in the report.
+    """
+    if simulate_s is None or total_s is None:
+        return
+    if simulate_s > total_s + _SIMULATE_LE_TOTAL_TOLERANCE_S:
+        raise RuntimeError(
+            f"[{topology}] {tool}: simulate_s ({simulate_s:.6f}s) exceeds "
+            f"total_s ({total_s:.6f}s) by more than "
+            f"{_SIMULATE_LE_TOTAL_TOLERANCE_S:.3f}s — inner-solver field "
+            "is probably aliased to a wall-clock stat; check the wrapper."
+        )
+
+
 # ---- FRR-only ground-truth path (Issue 4) --------------------------------
 
 
@@ -870,6 +998,12 @@ class ThreeWayAgreement:
     hammerhead_wall_s: float | None = None
     batfish_simulate_s: float | None = None
     hammerhead_simulate_s: float | None = None
+    # See :class:`SimOnlyAgreement` for field semantics. Surfaced here
+    # so three-way truth rows can report the fair
+    # ``solve_plus_materialize_ratio`` alongside the asymmetric
+    # ``solve_ratio``.
+    hammerhead_rib_total_s: float | None = None
+    hammerhead_simulate_plus_rib_s: float | None = None
 
     # B vs T
     batfish_vs_truth_both_keys: int = 0
@@ -1067,8 +1201,25 @@ def run_topology_frr_only_truth(
             hh_wall = _time.monotonic() - t0
             result.hammerhead_path = hh_dir
 
-        bf_sim = _read_stat(bf_dir / "batfish_stats.json", "total_s")
-        hh_sim = _read_stat(hh_dir / "hammerhead_stats.json", "total_s")
+        bf_sim = _read_stat(bf_dir / "batfish_stats.json", "simulate_s")
+        bf_total_stat = _read_stat(bf_dir / "batfish_stats.json", "total_s")
+        _assert_simulate_le_total("batfish", spec.name, bf_sim, bf_total_stat)
+        hh_sim = _read_stat(hh_dir / "hammerhead_stats.json", "simulate_s")
+        hh_rib = _read_stat(hh_dir / "hammerhead_stats.json", "rib_total_s")
+        hh_total_stat = _read_stat(hh_dir / "hammerhead_stats.json", "total_s")
+        _assert_simulate_le_total("hammerhead", spec.name, hh_sim, hh_total_stat)
+        if hh_sim is not None and hh_rib is not None:
+            _assert_simulate_le_total(
+                "hammerhead (simulate+rib)",
+                spec.name,
+                hh_sim + hh_rib,
+                hh_total_stat,
+            )
+        hh_sim_plus_rib = (
+            (hh_sim or 0.0) + (hh_rib or 0.0)
+            if hh_sim is not None or hh_rib is not None
+            else None
+        )
 
         agreement = _compute_three_way_agreement(
             spec=spec,
@@ -1080,6 +1231,8 @@ def run_topology_frr_only_truth(
             hammerhead_wall_s=hh_wall,
             batfish_simulate_s=bf_sim,
             hammerhead_simulate_s=hh_sim,
+            hammerhead_rib_total_s=hh_rib,
+            hammerhead_simulate_plus_rib_s=hh_sim_plus_rib,
         )
         result.three_way_agreement = agreement
         result.diff_path = diff_dir
@@ -1103,6 +1256,8 @@ def _compute_three_way_agreement(
     hammerhead_wall_s: float | None,
     batfish_simulate_s: float | None,
     hammerhead_simulate_s: float | None,
+    hammerhead_rib_total_s: float | None = None,
+    hammerhead_simulate_plus_rib_s: float | None = None,
 ) -> ThreeWayAgreement:
     """Diff all three pairs, persist records + agreement.json.
 
@@ -1132,6 +1287,8 @@ def _compute_three_way_agreement(
         hammerhead_wall_s=hammerhead_wall_s,
         batfish_simulate_s=batfish_simulate_s,
         hammerhead_simulate_s=hammerhead_simulate_s,
+        hammerhead_rib_total_s=hammerhead_rib_total_s,
+        hammerhead_simulate_plus_rib_s=hammerhead_simulate_plus_rib_s,
         batfish_vs_truth_both_keys=bt["both"],
         batfish_vs_truth_union_keys=bt["union"],
         batfish_vs_truth_presence=bt["presence"],
