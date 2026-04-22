@@ -33,22 +33,22 @@ differences do not inflate disagreement.
 
 | Topology | Nodes | Routes (bf / hh) | Presence | NH agree | BF wall | HH wall | Wall ratio | Fair ratio |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| bgp-ebgp-2node | 2 | 4 / 4 | 100% | 100.0% | 22.00±0.87s | 35.8±1.3ms | 613.6× | 157.7× |
-| bgp-ibgp-2node | 2 | 4 / 4 | 100% | 100.0% | 22.05±0.91s | 37.9±3.2ms | 581.8× | 142.4× |
-| acl-heavy-parse | 3 | 15 / 6 | 40% | 100.0% | 22.71±0.43s | 43.5±1.6ms | 522.4× | 127.4× |
-| ospf-p2p-3node | 3 | 15 / 6 | 40% | 100.0% | 21.86±0.58s | 44.0±1.3ms | 496.5× | 119.4× |
-| route-map-pathological | 3 | 15 / 15 | 100% | 100.0% | 23.19±0.82s | 59.3±7.3ms | 391.3× | 102.4× |
-| isis-l1l2-4node | 4 | 6 / 26 | 23% | 100.0% | 21.97±0.53s | 53.9±2.8ms | 407.5× | 93.8× |
-| mixed-vendor-frr-ceos-4node | 4 | 12 / 8 | 67% | 100.0% | 27.04±0.63s | 54.0±1.9ms | 500.7× | 102.5× |
-| mpls-l3vpn-4node | 4 | 26 / 8 | 21% | 100.0% | 24.14±0.31s | 54.2±2.1ms | 445.3× | 122.8× |
-| multi-as-edge-5node | 5 | 27 / 27 | 100% | 100.0% | 24.62±0.67s | 64.7±3.0ms | 380.8× | 91.6× |
-| ospf-broadcast-4node | 5 | 16 / 4 | 25% | 100.0% | 22.45±0.81s | 52.3±2.4ms | 429.5× | 103.7× |
-| spine-leaf-6node | 6 | 36 / 36 | 100% | 100.0% | 25.42±0.54s | 70.5±2.0ms | 360.4× | 93.9× |
-| route-reflector-6node | 7 | 36 / 36 | 100% | 100.0% | 25.10±0.72s | 72.0±0.8ms | 348.5× | 87.7× |
-| spine-leaf-20node | 20 | 432 / 432 | 100% | 100.0% | 35.49±0.67s | 264.0±28.0ms | 134.4× | 54.5× |
-| spine-leaf-50node | 50 | 2622 / 2622 | 100% | 100.0% | 51.09±0.77s | 1312.9±9.3ms | 38.9× | 19.7× |
-| hub-spoke-wan-51node | 51 | 5251 / 5251 | 100% | 100.0% | 44.42±0.45s | 1233.0±78.6ms | 36.0× | 16.3× |
-| spine-leaf-100node | 100 | 10355 / 10355 | 100% | 100.0% | 94.29±2.24s | 9164.1±282.0ms | 10.3× | 6.8× |
+| bgp-ebgp-2node | 2 | 4 / 4 | 100% | 100.0% | 21.51±0.75s | 27.0±0.8ms | 795.8× | 198.5× |
+| bgp-ibgp-2node | 2 | 4 / 4 | 100% | 100.0% | 22.07±0.94s | 27.2±0.8ms | 812.6× | 206.1× |
+| acl-heavy-parse | 3 | 15 / 6 | 40% | 100.0% | 22.42±0.64s | 83.2±1.8ms | 269.5× | 217.0× |
+| ospf-p2p-3node | 3 | 15 / 6 | 40% | 100.0% | 21.47±0.87s | 25.5±1.8ms | 841.3× | 219.4× |
+| route-map-pathological | 3 | 15 / 15 | 100% | 100.0% | 22.75±0.51s | 28.1±0.9ms | 810.4× | 215.2× |
+| isis-l1l2-4node | 4 | 6 / 26 | 23% | 100.0% | 21.88±0.66s | 28.0±0.6ms | 781.0× | 168.4× |
+| mixed-vendor-frr-ceos-4node | 4 | 12 / 8 | 67% | 100.0% | 27.93±0.74s | 33.1±10.9ms | 843.7× | 187.4× |
+| mpls-l3vpn-4node | 4 | 26 / 8 | 21% | 100.0% | 23.74±0.41s | 27.1±0.1ms | 876.2× | 253.2× |
+| multi-as-edge-5node | 5 | 27 / 27 | 100% | 100.0% | 24.45±0.74s | 27.7±0.8ms | 883.1× | 229.3× |
+| ospf-broadcast-4node | 5 | 16 / 4 | 25% | 100.0% | 22.81±0.66s | 26.4±0.7ms | 862.6× | 214.6× |
+| spine-leaf-6node | 6 | 36 / 36 | 100% | 100.0% | 25.10±0.33s | 29.5±0.8ms | 850.3× | 235.5× |
+| route-reflector-6node | 7 | 36 / 36 | 100% | 100.0% | 25.42±0.21s | 28.2±0.4ms | 901.9× | 250.9× |
+| spine-leaf-20node | 20 | 432 / 432 | 100% | 100.0% | 35.65±0.67s | 51.0±6.3ms | 699.4× | 362.4× |
+| spine-leaf-50node | 50 | 2622 / 2622 | 100% | 100.0% | 51.51±0.92s | 140.3±3.3ms | 367.2× | 299.7× |
+| hub-spoke-wan-51node | 51 | 5251 / 5251 | 100% | 100.0% | 45.14±0.59s | 117.1±13.3ms | 385.5× | 259.2× |
+| spine-leaf-100node | 100 | 10355 / 10355 | 100% | 100.0% | 90.26±1.00s | 577.9±17.7ms | 156.2× | 199.8× |
 
 Wall ratio includes JVM startup and snapshot upload on the Batfish
 side; fair ratio is the apples-to-apples solve+materialize comparison
@@ -64,15 +64,19 @@ modeling difference rather than a simulator disagreement
 
 **Aggregate over the corpus.** The headline aggregate is the
 unweighted mean of per-topology `fair_ratio` across all 16 topologies
-(definition in § 2): **mean = 90×** (median 98×, range **6.8×** at
-the 100-node spine-leaf to **157.7×** at 2-node BGP, n=16). The
+(definition in § 2): **mean = 232×** (median 218×, range **168×** at
+4-node IS-IS to **362×** at 20-node spine-leaf, n=16). The
 corresponding unweighted-mean `wall_ratio` (includes Batfish JVM +
-snapshot upload) is **356×**; the `asym_ratio` lower bound is
-**310×**. We do not recommend citing any single aggregate as a
+snapshot upload) is **696×**; post-migration (see § 3, "Harness
+migration history") the `asym_ratio` lower bound collapses onto
+`fair_ratio` because the Hammerhead-side RIB materialization step is
+now inside the single `simulate --emit-rib all` call the numerator
+measures. We do not recommend citing any single aggregate as a
 headline speedup number without qualification; § 3 explains the
-regime structure — ratios contract monotonically with route count
-because Batfish's fixed ~22 s init cost amortizes over larger solves,
-while Hammerhead scales ~linearly with the RIB.
+regime structure — ratios still contract with topology size on the
+`wall_ratio` axis because Batfish's fixed ~22 s init cost amortizes
+over larger solves, but the `fair_ratio` curve is now much flatter
+than it was under the per-device-rib harness.
 
 **Agreement.** On the intersection of (node, vrf, prefix) cells
 installed by both tools (the `|B ∩ H|` column in the per-topology
@@ -315,6 +319,23 @@ of the headline ratio they should trust.
   across repeated runs on the same config directory, which we
   rely on as a sanity check but do not claim as a tested
   invariant of this artifact.
+- **Harness migration history.** The Hammerhead-side denominator
+  was rewritten 2026-04-22 against Hammerhead commit
+  [`b46eb45`](https://github.com/optimesh-ai/hammerhead/commit/b46eb45),
+  which introduced `hammerhead simulate --emit-rib all --format
+  json`. The pre-migration harness shelled out to
+  `hammerhead simulate` for topology + one `hammerhead rib
+  --device <h>` subprocess per hostname to materialize FIBs
+  (i.e. N+1 process launches per topology). The numbers shown
+  here — including the headline `fair_ratio` aggregates and
+  every per-topology row in § 1 — use the bulk-emit path, which
+  issues exactly one subprocess per topology and folds RIB
+  materialization into the single solve. `hammerhead_rib_total_s`
+  is retained in `results/<topology>.json` as `0.0` for schema
+  stability; the `asym_ratio` / `fair_ratio` fields therefore
+  converge in the post-migration corpus. See
+  `results/CHANGELOG.md` for the per-topology delta between the
+  last pre-migration run and this one.
 
 ## 4. Related work
 
@@ -517,12 +538,13 @@ Beyond the threats in § 3:
   topology here. Hammerhead itself has been exercised at
   ≥ 5,120 nodes, and Batfish has been reported on networks of
   comparable size by its maintainers, but we have not measured
-  either on 1,000+ -node configs *in this harness*. The **10.3×
-  wall / 6.8× fair** ratio at 100 nodes is the most informative
-  single datum for extrapolation, and it is deliberately the
-  smallest ratio we report. Scale-regime readers should weight
-  the 20-/50-/100-node rows more heavily than the 2-/3-/4-node
-  rows when extrapolating to production-sized fabrics.
+  either on 1,000+ -node configs *in this harness*. The **156×
+  wall / 200× fair** ratio at 100 nodes is the most informative
+  single datum for extrapolation; it is the smallest `wall_ratio`
+  we report but sits near the corpus median on `fair_ratio`.
+  Scale-regime readers should weight the 20-/50-/100-node rows
+  more heavily than the 2-/3-/4-node rows when extrapolating to
+  production-sized fabrics.
 - **We do not measure peak RSS in sim-only mode.** The header
   of § 1 is wall-clock-only. `--with-truth` mode does
   measure RSS; sim-only does not, because the Batfish-in-

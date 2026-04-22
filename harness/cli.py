@@ -685,6 +685,11 @@ def _default_hammerhead_hook(configs_dir: Path, out_dir: Path, topology: str) ->
     Honors ``$HAMMERHEAD_CLI`` + fake binary scripts via environment, so the
     offline smoke path (``$HAMMERHEAD_CLI=scripts/fake_hammerhead.sh``) works
     without a real Rust binary.
+
+    Loads the ``TopologySpec`` to derive the expected node list and
+    passes it through to ``run_hammerhead``; a bulk-emit response
+    missing any expected device fails the bench loudly rather than
+    silently reducing coverage.
     """
     from harness.tools.hammerhead import HammerheadConfig, resolve_hammerhead_cli  # noqa: PLC0415
 
@@ -696,7 +701,26 @@ def _default_hammerhead_hook(configs_dir: Path, out_dir: Path, topology: str) ->
     if fake_source is None and Path(cfg.hammerhead_cli).name == "fake_hammerhead.sh":
         fake_source = str(out_dir.parent.parent / "vendor_truth" / topology)
         os.environ["FAKE_HAMMERHEAD_SOURCE_DIR"] = fake_source
-    run_hammerhead(configs_dir, out_dir, topology=topology, config=cfg)
+
+    expected_hostnames: list[str] | None = None
+    topo_dir = REPO_ROOT / "topologies" / topology
+    if (topo_dir / "topo.py").exists():
+        spec = load_spec(topo_dir)
+        # Only expect hostnames for nodes that actually emit configs.
+        # Containerlab `bridge` nodes (L2 plumbing, e.g. ospf-broadcast-4node's
+        # `hub`) have an empty `config_template_names` tuple and are invisible
+        # to Hammerhead — correctly so, since they have no routing state.
+        expected_hostnames = [
+            n.name for n in spec.nodes if n.adapter.config_template_names
+        ]
+
+    run_hammerhead(
+        configs_dir,
+        out_dir,
+        topology=topology,
+        config=cfg,
+        expected_hostnames=expected_hostnames,
+    )
 
 
 if __name__ == "__main__":

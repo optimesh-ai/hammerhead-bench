@@ -1,17 +1,38 @@
-"""Hammerhead CLI wrapper — Phase 6 deliverable.
+"""Hammerhead CLI wrapper — bulk ``simulate --emit-rib all`` path.
 
-Shells out to ``$HAMMERHEAD_CLI`` twice per topology:
+Shells out to ``$HAMMERHEAD_CLI`` **once** per topology (post Hammerhead
+commit b46eb45 / 2026-04-22):
 
-1. ``hammerhead simulate <configs_dir> --format json`` — returns a
-   :py:mod:`SimulateSummaryJson`-shaped object with a ``devices[]`` list
-   of hostnames. Used to discover which devices to query.
-2. ``hammerhead rib --config-dir <configs_dir> --device <X> --format json``
-   — returns one device's full RIB (all VRFs flattened).
+    hammerhead simulate <configs_dir> --emit-rib all --format json
 
-Each device response is routed through
+The response is a single JSON object shaped as::
+
+    {
+      "rib": {
+        "<hostname-A>": {"hostname": "<hostname-A>", "entries": [...]},
+        "<hostname-B>": {"hostname": "<hostname-B>", "entries": [...]},
+        ...
+      }
+    }
+
+Each device view is routed through
 :func:`harness.tools.hammerhead_transform.transform_rib_view` to produce
 canonical :class:`NodeFib` rows, written to
 ``<out_dir>/<hostname>__default.json``.
+
+Historical note — **per-device rib loop, removed 2026-04-22:**
+Before Hammerhead commit b46eb45 landed the bulk emit-rib API, the
+harness shelled out ``hammerhead simulate`` once for device discovery
+and then looped ``hammerhead rib --device <X>`` per device (N+1
+subprocesses per topology). Each of those extra invocations rebuilt the
+full Pipeline from scratch (re-parse, re-simulate every protocol) so
+the per-device rib phase dominated Hammerhead's measured wall-clock on
+larger topologies. Switching to a single bulk emit collapses that N+1
+subprocess tax into one invocation that runs ``Pipeline::build``
+exactly once (enforced by an integration test in the Hammerhead repo:
+``crates/hammerhead-cli/tests/pipeline_build_count.rs``), which is why
+post-migration numbers are dramatically faster than the pre-migration
+corpus.
 
 Test seams: :class:`HammerheadRunner` is a Protocol injected via the
 ``runner`` keyword argument. Production default is
@@ -37,7 +58,7 @@ import os
 import shutil
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -71,6 +92,22 @@ class HammerheadStats:
 
     Written alongside the per-device NodeFib JSON so the report layer
     can render a per-topology table without re-parsing anything.
+
+    Field semantics (post bulk-emit migration, 2026-04-22):
+
+    * ``simulate_s`` — wall-clock of the single
+      ``hammerhead simulate --emit-rib all`` subprocess. Covers solver
+      work **and** per-device RIB materialization in one shot (the
+      bulk emit amortises ``Pipeline::build`` across every device).
+    * ``rib_total_s`` — legacy field, **always 0.0** in the bulk path.
+      Retained for results-JSON schema backward compatibility so
+      downstream consumers (report layer, Batfish comparison glue) do
+      not need to branch on pre- vs post-migration shape. ``fair_ratio``
+      still sums ``simulate_s + rib_total_s`` in its denominator; with
+      ``rib_total_s == 0`` it collapses to ``batfish_simulate_s /
+      simulate_s`` — i.e. ``fair_ratio`` and ``asym_ratio`` converge
+      post-migration. See ``pipeline.py::ASYM_RATIO_NOTE`` and
+      README § 2 for the formal discussion.
     """
 
     topology: str
@@ -86,20 +123,22 @@ class HammerheadStats:
 
 
 class HammerheadRunner(Protocol):
-    """Test seam for the two shell-outs the wrapper makes.
+    """Test seam for the one shell-out the wrapper makes.
 
     Default = :class:`SubprocessHammerheadRunner`. Unit tests inject a
     fake that returns canned JSON so the orchestration path runs
     without a real binary on the host.
     """
 
-    def simulate(self, cfg: HammerheadConfig, configs_dir: Path) -> dict[str, Any]:
-        """Run ``simulate`` and return the parsed JSON."""
-
-    def rib(
-        self, cfg: HammerheadConfig, configs_dir: Path, device: str
+    def simulate_emit_rib_all(
+        self, cfg: HammerheadConfig, configs_dir: Path
     ) -> dict[str, Any]:
-        """Run ``rib --device <device>`` and return the parsed JSON."""
+        """Run ``simulate --emit-rib all`` and return the parsed JSON.
+
+        Expected shape::
+
+            {"rib": {"<hostname>": {"hostname": "...", "entries": [...]}}}
+        """
 
 
 @dataclass(slots=True)
@@ -115,37 +154,26 @@ class SubprocessHammerheadRunner:
         default_factory=lambda: _subprocess_run
     )
 
-    def simulate(self, cfg: HammerheadConfig, configs_dir: Path) -> dict[str, Any]:
-        rc, out, err = self.run_cmd(
-            [cfg.hammerhead_cli, "simulate", str(configs_dir), "--format", "json"],
-            cfg.timeout_s,
-        )
-        if rc != 0:
-            raise RuntimeError(
-                f"hammerhead simulate failed (rc={rc}): {err or out}"
-            )
-        return _parse_json(out, origin="hammerhead simulate")
-
-    def rib(
-        self, cfg: HammerheadConfig, configs_dir: Path, device: str
+    def simulate_emit_rib_all(
+        self, cfg: HammerheadConfig, configs_dir: Path
     ) -> dict[str, Any]:
         rc, out, err = self.run_cmd(
             [
                 cfg.hammerhead_cli,
-                "rib",
-                "--device",
-                device,
+                "simulate",
+                str(configs_dir),
+                "--emit-rib",
+                "all",
                 "--format",
                 "json",
-                str(configs_dir),
             ],
             cfg.timeout_s,
         )
         if rc != 0:
             raise RuntimeError(
-                f"hammerhead rib {device} failed (rc={rc}): {err or out}"
+                f"hammerhead simulate --emit-rib all failed (rc={rc}): {err or out}"
             )
-        return _parse_json(out, origin=f"hammerhead rib {device}")
+        return _parse_json(out, origin="hammerhead simulate --emit-rib all")
 
 
 def _subprocess_run(cmd: list[str], timeout_s: float) -> tuple[int, str, str]:
@@ -187,6 +215,7 @@ def run_hammerhead(
     topology: str,
     runner: HammerheadRunner | None = None,
     config: HammerheadConfig | None = None,
+    expected_hostnames: Iterable[str] | None = None,
 ) -> HammerheadStats:
     """Run Hammerhead against ``configs_dir``, write canonical NodeFibs.
 
@@ -195,9 +224,16 @@ def run_hammerhead(
     - ``<out_dir>/<hostname>__default.json`` — one NodeFib per device
     - ``<out_dir>/hammerhead_stats.json`` — timing + route counts
 
-    Raises ``RuntimeError`` if the CLI binary can't be found or returns
-    non-zero. The caller's memory guard is responsible for any host-level
-    cap.
+    Raises ``RuntimeError`` if the CLI binary can't be found, returns
+    non-zero, emits malformed JSON, or — when ``expected_hostnames`` is
+    supplied — if the bulk RIB response is missing any of those hosts.
+    The caller's memory guard is responsible for any host-level cap.
+
+    ``expected_hostnames`` is the topology's full node list (passed by
+    the default hook, which loads the ``TopologySpec``). We assert
+    every expected host is a key in the response so a silent
+    dropped-device bug in the Hammerhead pipeline surfaces loudly as a
+    bench failure rather than a coverage regression.
     """
     cfg = config or HammerheadConfig()
     rn: HammerheadRunner = runner or SubprocessHammerheadRunner()
@@ -216,28 +252,43 @@ def run_hammerhead(
     t0 = time.monotonic()
 
     t_sim = time.monotonic()
-    sim_view = rn.simulate(cfg, configs_dir)
+    bulk = rn.simulate_emit_rib_all(cfg, configs_dir)
     sim_s = time.monotonic() - t_sim
 
-    devices = _device_hostnames(sim_view)
-    log.info("hammerhead: %s -> %d devices", topology, len(devices))
+    rib_map = _extract_rib_map(bulk)
 
-    t_rib = time.monotonic()
+    if expected_hostnames is not None:
+        expected = {h.strip() for h in expected_hostnames if h and h.strip()}
+        got = set(rib_map.keys())
+        missing = sorted(expected - got)
+        if missing:
+            raise RuntimeError(
+                "hammerhead simulate --emit-rib all: response missing "
+                f"expected device(s) for topology {topology!r}: {missing}; "
+                f"got {sorted(got)}"
+            )
+
+    hostnames = sorted(rib_map.keys())
+    log.info(
+        "hammerhead: %s -> %d devices (bulk emit-rib)", topology, len(hostnames)
+    )
+
     total_routes = 0
-    for hostname in devices:
-        view = rn.rib(cfg, configs_dir, hostname)
+    for hostname in hostnames:
+        view = rib_map[hostname]
         fib = transform_rib_view(view)
         out_path = out_dir / f"{fib.node}__{fib.vrf}.json"
         out_path.write_text(fib.model_dump_json(indent=2) + "\n")
         total_routes += len(fib.routes)
-    rib_s = time.monotonic() - t_rib
 
     stats = HammerheadStats(
         topology=topology,
         started_iso=started_iso,
         simulate_s=sim_s,
-        rib_total_s=rib_s,
-        device_count=len(devices),
+        # Bulk emit path — no separate rib phase. Field retained for
+        # results-JSON schema stability; see HammerheadStats docstring.
+        rib_total_s=0.0,
+        device_count=len(hostnames),
         total_routes=total_routes,
         total_s=time.monotonic() - t0,
     )
@@ -247,23 +298,35 @@ def run_hammerhead(
     return stats
 
 
-def _device_hostnames(sim_view: dict[str, Any]) -> list[str]:
-    """Extract hostnames from a simulate JSON response.
+def _extract_rib_map(bulk: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Extract ``{hostname: view}`` from the bulk emit-rib response.
 
-    Shape: ``{..., "devices": [{"hostname": "r1", ...}, ...]}``.
-    Returns a sorted list so iteration is deterministic.
+    Shape::
+
+        {"rib": {"<hostname>": {"hostname": "...", "entries": [...]}}}
+
+    Returns a ``dict`` keyed by (trimmed, non-empty) hostname. Entries
+    whose top-level key disagrees with the nested ``hostname`` field,
+    or whose value is not an object, are dropped silently — the
+    caller's ``expected_hostnames`` assertion is the place that turns
+    a missing device into a loud failure.
     """
-    raw = sim_view.get("devices")
-    if not isinstance(raw, list):
-        return []
-    hostnames: set[str] = set()
-    for d in raw:
-        if not isinstance(d, dict):
+    rib = bulk.get("rib")
+    if not isinstance(rib, dict):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for k, v in rib.items():
+        if not isinstance(k, str) or not k.strip():
             continue
-        hn = d.get("hostname")
-        if isinstance(hn, str) and hn.strip():
-            hostnames.add(hn.strip())
-    return sorted(hostnames)
+        if not isinstance(v, dict):
+            continue
+        # Prefer the nested hostname when present; fall back to the
+        # top-level key. The Hammerhead CLI emits both; guard against
+        # drift where one side is dropped.
+        nested = v.get("hostname")
+        host = (nested if isinstance(nested, str) and nested.strip() else k).strip()
+        out[host] = v
+    return out
 
 
 # Environment discovery helper. Used by callers that want to surface

@@ -1,6 +1,7 @@
 # Runtime outputs — all regenerable.
 results/*
 !results/.gitkeep
+!results/CHANGELOG.md
 snapshots/
 .env
 

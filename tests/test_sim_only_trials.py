@@ -25,7 +25,7 @@ from click.testing import CliRunner
 
 from harness.cli import main
 from harness.extract.fib import NextHop, NodeFib, Route
-from harness.pipeline import BenchHooks, run_topology_sim_only
+from harness.pipeline import ASYM_RATIO_NOTE, BenchHooks, run_topology_sim_only
 from harness.topology import load_spec
 
 TOPO_DIR = Path(__file__).resolve().parent.parent / "topologies" / "bgp-ibgp-2node"
@@ -147,7 +147,12 @@ def test_run_topology_sim_only_trials_collects_per_trial_timings(tmp_path: Path)
     # trial_stats carries {mean, std, min, max} for each timing series.
     stats = a.trial_stats
     assert stats is not None
-    for field_name in ("batfish_wall_s", "hammerhead_wall_s", "batfish_simulate_s", "hammerhead_simulate_s"):
+    for field_name in (
+        "batfish_wall_s",
+        "hammerhead_wall_s",
+        "batfish_simulate_s",
+        "hammerhead_simulate_s",
+    ):
         assert field_name in stats
         payload = stats[field_name]
         assert set(payload) == {"mean", "std", "min", "max"}
@@ -222,10 +227,14 @@ def test_agreement_exposes_fair_solve_plus_materialize_ratio(tmp_path: Path) -> 
     # consumers don't break.
     assert d["fair_ratio"] == pytest.approx(0.90 / 0.20)
     assert d["asym_ratio"] == pytest.approx(0.90 / 0.02)
-    assert d["asym_ratio_note"] == (
-        "Hammerhead-favoring lower bound; see README §2. "
-        "Do not cite as headline."
-    )
+    # Post-b46eb45 bulk-emit migration: the caveat text switched from
+    # "Hammerhead-favoring lower bound" to a historical note explaining
+    # that asym and fair now converge (rib_total_s is always 0). Source
+    # of truth is ``harness.pipeline.ASYM_RATIO_NOTE`` — asserting
+    # against that module constant keeps this test robust to future
+    # phrasing tweaks.
+    assert d["asym_ratio_note"] == ASYM_RATIO_NOTE
+    assert "converge" in d["asym_ratio_note"]
     # ``wall_ratio`` tracks Batfish wall / Hammerhead wall end-to-end.
     # _CountingHook sets total_s ≈ simulate_s + rib_total_s + 0.001, so
     # the two wall values are dominated by the per-side sidecar scalars.

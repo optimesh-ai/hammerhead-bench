@@ -390,8 +390,9 @@ def _write_metrics(metrics: TopologyMetrics, path: Path) -> None:
 # just in the README) so a downstream script that only ingests the JSON
 # can't miss it. README § 2 carries the formal definition.
 ASYM_RATIO_NOTE = (
-    "Hammerhead-favoring lower bound; see README §2. "
-    "Do not cite as headline."
+    "Historically a Hammerhead-favoring lower bound when the harness "
+    "used per-device rib calls; post-b46eb45 migration to bulk emit, "
+    "asym_ratio and fair_ratio converge. Kept for schema stability."
 )
 
 
