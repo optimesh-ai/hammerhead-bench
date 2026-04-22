@@ -529,11 +529,29 @@ def run_batfish(
             stage_root = Path(stage_root_str)
             stage_cfg_dir = stage_root / "configs"
             stage_cfg_dir.mkdir(parents=True, exist_ok=True)
+            aws_stage: Path | None = None
             for child in sorted(configs_dir.iterdir()):
                 if child.is_dir():
-                    frr_path = child / "frr.conf"
-                    if frr_path.is_file():
-                        shutil.copyfile(frr_path, stage_cfg_dir / f"{child.name}.cfg")
+                    # Mixed-vendor topologies (cEOS + FRR, Junos + FRR) drop a
+                    # per-vendor config file in each <device>/ subdir. Pick the
+                    # first one that matches our known set; Batfish auto-detects
+                    # vendor from content once it's named <device>.cfg.
+                    picked = None
+                    for candidate in ("frr.conf", "startup-config", "running-config", "config.boot", "config"):
+                        p = child / candidate
+                        if p.is_file():
+                            picked = p
+                            break
+                    if picked is not None:
+                        shutil.copyfile(picked, stage_cfg_dir / f"{child.name}.cfg")
+                        continue
+                    # AWS describe-* JSON snapshot lives in configs/aws/. Batfish
+                    # expects aws_configs/ at the snapshot root.
+                    if child.name == "aws":
+                        aws_stage = stage_root / "aws_configs"
+                        aws_stage.mkdir(parents=True, exist_ok=True)
+                        for aws_file in sorted(child.glob("*.json")):
+                            shutil.copyfile(aws_file, aws_stage / aws_file.name)
                 elif child.is_file() and child.suffix in {".cfg", ".conf"}:
                     shutil.copyfile(child, stage_cfg_dir / child.name)
             session.init_snapshot(str(stage_root), name=f"bench-{topology}", overwrite=True)

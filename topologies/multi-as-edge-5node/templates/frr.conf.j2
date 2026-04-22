@@ -1,0 +1,91 @@
+frr defaults traditional
+hostname {{ node.name }}
+no ipv6 forwarding
+!
+interface lo
+ ip address {{ params.loopback }}/32
+!
+{% for iface in node.interfaces %}
+interface {{ iface.name }}
+{%- if iface.description %}
+ description {{ iface.description }}
+{%- endif %}
+{%- if iface.ip %}
+ ip address {{ iface.ip }}
+{%- endif %}
+!
+{% endfor %}
+{%- if params.role == "edge" %}
+ip prefix-list PL_OWN seq 10 permit {{ params.originate_prefix }}
+!
+bgp community-list standard CL_CUSTOMER permit {{ params.asn }}:100
+bgp community-list standard CL_PEER permit {{ params.asn }}:200
+bgp community-list standard CL_UPSTREAM permit {{ params.asn }}:300
+!
+route-map FROM_CUSTOMER permit 10
+ set local-preference 200
+ set community {{ params.asn }}:100 additive
+!
+route-map FROM_PEER permit 10
+ set local-preference 150
+ set community {{ params.asn }}:200 additive
+!
+route-map FROM_UPSTREAM permit 10
+ set local-preference 100
+ set community {{ params.asn }}:300 additive
+!
+route-map TO_PEER_OR_UPSTREAM permit 10
+ match community CL_CUSTOMER
+!
+route-map TO_PEER_OR_UPSTREAM permit 20
+ match ip address prefix-list PL_OWN
+!
+route-map TO_CUSTOMER permit 10
+!
+router bgp {{ params.asn }}
+ bgp router-id {{ params.loopback }}
+ no bgp ebgp-requires-policy
+ bgp log-neighbor-changes
+{%- for n in params.neighbors %}
+ neighbor {{ n.ip }} remote-as {{ n.asn }}
+ neighbor {{ n.ip }} description {{ n.description }}
+{%- endfor %}
+ !
+ address-family ipv4 unicast
+  network {{ params.originate_prefix }}
+{%- for n in params.neighbors %}
+  neighbor {{ n.ip }} activate
+  neighbor {{ n.ip }} send-community
+{%- if n.peer_class == "customer" %}
+  neighbor {{ n.ip }} route-map FROM_CUSTOMER in
+  neighbor {{ n.ip }} route-map TO_CUSTOMER out
+{%- elif n.peer_class == "peer" %}
+  neighbor {{ n.ip }} route-map FROM_PEER in
+  neighbor {{ n.ip }} route-map TO_PEER_OR_UPSTREAM out
+{%- elif n.peer_class == "upstream" %}
+  neighbor {{ n.ip }} route-map FROM_UPSTREAM in
+  neighbor {{ n.ip }} route-map TO_PEER_OR_UPSTREAM out
+{%- endif %}
+{%- endfor %}
+ exit-address-family
+!
+ip route {{ params.originate_prefix }} Null0
+!
+{%- else %}
+router bgp {{ params.asn }}
+ bgp router-id {{ params.loopback }}
+ no bgp ebgp-requires-policy
+ bgp log-neighbor-changes
+ neighbor {{ params.peer_ip }} remote-as {{ params.peer_asn }}
+ neighbor {{ params.peer_ip }} description {{ params.peer_description }}
+ !
+ address-family ipv4 unicast
+  network {{ params.originate_prefix }}
+  neighbor {{ params.peer_ip }} activate
+ exit-address-family
+!
+ip route {{ params.originate_prefix }} Null0
+!
+{%- endif %}
+line vty
+!

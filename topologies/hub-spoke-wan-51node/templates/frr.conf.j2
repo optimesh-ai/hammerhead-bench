@@ -1,0 +1,66 @@
+frr defaults traditional
+hostname {{ node.name }}
+no ipv6 forwarding
+!
+interface lo
+ ip address {{ params.loopback }}/32
+!
+{% for iface in node.interfaces %}
+interface {{ iface.name }}
+{%- if iface.description %}
+ description {{ iface.description }}
+{%- endif %}
+{%- if iface.ip %}
+ ip address {{ iface.ip }}
+{%- endif %}
+!
+{% endfor %}
+{%- if params.role == "hub" %}
+ip prefix-list ADVERTISE_DEFAULT seq 10 permit 0.0.0.0/0
+!
+route-map FROM_BRANCH permit 10
+ set local-preference 100
+!
+router bgp {{ params.asn }}
+ bgp router-id {{ params.loopback }}
+ no bgp ebgp-requires-policy
+ bgp log-neighbor-changes
+{%- for peer in params.hub_peers %}
+ neighbor {{ peer.ip }} remote-as {{ peer.asn }}
+ neighbor {{ peer.ip }} description {{ peer.description }}
+{%- endfor %}
+ !
+ address-family ipv4 unicast
+  network {{ params.loopback }}/32
+  network {{ params.default_advertisement }}
+{%- for peer in params.hub_peers %}
+  neighbor {{ peer.ip }} activate
+  neighbor {{ peer.ip }} route-map FROM_BRANCH in
+{%- endfor %}
+ exit-address-family
+!
+ip route {{ params.default_advertisement }} Null0
+!
+{%- else %}
+route-map TO_HUB permit 10
+ set med 100
+!
+router bgp {{ params.asn }}
+ bgp router-id {{ params.loopback }}
+ no bgp ebgp-requires-policy
+ bgp log-neighbor-changes
+ neighbor {{ params.hub_ip }} remote-as {{ params.hub_asn }}
+ neighbor {{ params.hub_ip }} description ebgp to hub
+ !
+ address-family ipv4 unicast
+  network {{ params.loopback }}/32
+  network {{ params.site_prefix }}
+  neighbor {{ params.hub_ip }} activate
+  neighbor {{ params.hub_ip }} route-map TO_HUB out
+ exit-address-family
+!
+ip route {{ params.site_prefix }} Null0
+!
+{%- endif %}
+line vty
+!

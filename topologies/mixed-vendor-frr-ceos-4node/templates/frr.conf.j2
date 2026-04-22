@@ -1,0 +1,45 @@
+frr defaults traditional
+hostname {{ node.name }}
+no ipv6 forwarding
+!
+interface lo
+ ip address {{ params.loopback }}/32
+ ip ospf area {{ params.area }}
+!
+{% for iface in node.interfaces %}
+interface {{ iface.name }}
+{%- if iface.description %}
+ description {{ iface.description }}
+{%- endif %}
+{%- if iface.ip %}
+ ip address {{ iface.ip }}
+{%- endif %}
+ ip ospf area {{ params.area }}
+ ip ospf network point-to-point
+!
+{% endfor %}
+router ospf
+ ospf router-id {{ params.loopback }}
+ passive-interface lo
+!
+router bgp {{ params.asn }}
+ bgp router-id {{ params.loopback }}
+ no bgp ebgp-requires-policy
+ bgp log-neighbor-changes
+{%- for peer in params.ibgp_peers %}
+ neighbor {{ peer.ip }} remote-as {{ peer.asn }}
+ neighbor {{ peer.ip }} update-source lo
+ neighbor {{ peer.ip }} description {{ peer.description }}
+{%- endfor %}
+ !
+ address-family ipv4 unicast
+  maximum-paths ibgp 2
+  network {{ params.loopback }}/32
+{%- for peer in params.ibgp_peers %}
+  neighbor {{ peer.ip }} activate
+  neighbor {{ peer.ip }} next-hop-self
+{%- endfor %}
+ exit-address-family
+!
+line vty
+!
