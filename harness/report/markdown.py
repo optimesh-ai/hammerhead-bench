@@ -58,12 +58,24 @@ def render_markdown(data: ReportData) -> str:
         lines.extend(_sim_only_headline_block(data.summary))
         lines.append("")
         lines.extend(_sim_only_per_topology_table(data.topologies))
+    elif data.summary.get("mode") == "frr_only_truth":
+        lines.extend(_sim_only_headline_block(data.summary))
+        lines.append("")
+        lines.extend(_sim_only_per_topology_table(data.topologies))
+        truth_section = _truth_section(data.topologies)
+        if truth_section:
+            lines.append("")
+            lines.extend(truth_section)
     else:
         lines.extend(_headline_block(data.summary))
         lines.append("")
         lines.extend(_per_topology_table(data.topologies))
         lines.append("")
         lines.extend(_per_protocol_table(data.metrics))
+        truth_section = _truth_section(data.topologies)
+        if truth_section:
+            lines.append("")
+            lines.extend(truth_section)
     lines.append("")
     lines.extend(_failed_block(data.topologies))
     lines.append("")
@@ -330,6 +342,53 @@ def _per_protocol_table(metrics: Iterable[TopologyMetrics]) -> list[str]:
             f"| {proto} | "
             f"{_fmt_rate(_mean(b)) if b else '-'} | "
             f"{_fmt_rate(_mean(h)) if h else '-'} |"
+        )
+    return lines
+
+
+def _truth_section(topologies: list[TopologyRow]) -> list[str]:
+    """Ground-truth agreement (FRR subset) — omitted entirely when empty.
+
+    Only rendered when at least one topology carries
+    ``truth_source != None``. Columns expose all three pairwise agreement
+    triads (B↔T, H↔T, B↔H) plus the truth-route count so reviewers can
+    see the denominator alongside the rate.
+    """
+    rows_with_truth = [
+        row for row in topologies
+        if (row.run.get("truth_source") is not None)
+        and (row.run.get("three_way_agreement") is not None)
+    ]
+    if not rows_with_truth:
+        return []
+
+    lines: list[str] = []
+    lines.append("## Ground-truth agreement (FRR subset)")
+    lines.append("")
+    lines.append(
+        "Collected on Linux hosts with containerlab + Docker. The subset of "
+        "topologies that are pure FRR/Cumulus with ≤20 nodes can additionally "
+        "be compared against live vendor RIBs (T). Topologies outside the "
+        "subset fall back to the sim-only table above; their ``truth_source`` "
+        "is null in the result JSON."
+    )
+    lines.append("")
+    lines.append(
+        "| Topology | Truth routes | B vs T presence | B vs T NH | "
+        "H vs T presence | H vs T NH | B vs H presence | B vs H NH |"
+    )
+    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+    for row in rows_with_truth:
+        a = row.run.get("three_way_agreement") or {}
+        lines.append(
+            f"| {row.topology} | "
+            f"{a.get('truth_routes', '-')} | "
+            f"{_fmt_rate(a.get('batfish_vs_truth_presence'))} | "
+            f"{_fmt_rate(a.get('batfish_vs_truth_next_hop'))} | "
+            f"{_fmt_rate(a.get('hammerhead_vs_truth_presence'))} | "
+            f"{_fmt_rate(a.get('hammerhead_vs_truth_next_hop'))} | "
+            f"{_fmt_rate(a.get('batfish_vs_hammerhead_presence'))} | "
+            f"{_fmt_rate(a.get('batfish_vs_hammerhead_next_hop'))} |"
         )
     return lines
 

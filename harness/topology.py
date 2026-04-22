@@ -124,3 +124,46 @@ def load_spec(topology_dir: Path) -> TopologySpec:
             f"{topo_py}:SPEC must be a TopologySpec, got {type(topo_spec).__name__}"
         )
     return topo_spec
+
+
+# ----- FRR-only-truth eligibility -----------------------------------------
+
+# Vendor-adapter ``kind`` values that can be brought up under containerlab on a
+# Linux host without a proprietary image (FRR / Cumulus are both FRR-stack).
+# Kept as a module-level frozenset so tests can assert on it directly.
+_FRR_ONLY_TRUTH_ADAPTER_KINDS: frozenset[str] = frozenset({"frr", "cumulus_vx"})
+
+# Containerlab resource ceiling on a typical laptop: past ~20 FRR containers
+# memory + veth bring-up gets flaky, so we carve that cap in here rather than
+# letting a large topology silently OOM a Linux CI runner.
+FRR_ONLY_TRUTH_MAX_NODES: int = 20
+
+
+def frr_only_truth_eligible(spec: TopologySpec) -> bool:
+    """Return True when *spec* can run under the ``--frr-only-truth`` pipeline.
+
+    The eligibility rules are:
+
+    1. The spec must not rely on an ``external_renderer`` — those topologies
+       bypass the Jinja + clab YAML path, so the 3-way pipeline can't rendered
+       a clab YAML for them. (The ``--sim-only`` path is still fine.)
+    2. Every node in the spec must use an adapter whose ``kind`` is one of
+       :data:`_FRR_ONLY_TRUTH_ADAPTER_KINDS` — i.e. purely FRR / Cumulus.
+       A single Cisco / Juniper node disqualifies the whole topology.
+    3. The spec must have at most :data:`FRR_ONLY_TRUTH_MAX_NODES` nodes
+       (inclusive). Larger topologies exceed the memory + veth budget of a
+       typical containerlab-capable laptop / CI runner.
+
+    This function is pure; callers run it before any container / subprocess
+    work. It only inspects the ``TopologySpec`` in-memory so it's trivially
+    unit-testable and safe to call from the CLI selection path.
+    """
+    if spec.external_renderer is not None:
+        return False
+    if len(spec.nodes) > FRR_ONLY_TRUTH_MAX_NODES:
+        return False
+    for node in spec.nodes:
+        kind = getattr(node.adapter, "kind", None)
+        if kind not in _FRR_ONLY_TRUTH_ADAPTER_KINDS:
+            return False
+    return True

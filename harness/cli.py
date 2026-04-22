@@ -23,10 +23,13 @@ import click
 from harness.diff.metrics import TopologyMetrics, aggregate_many
 from harness.pipeline import (
     BenchHooks,
+    FrrOnlyTruthResult,
     SimOnlyAgreement,
     SimOnlyResult,
+    ThreeWayAgreement,
     aggregate_sim_only,
     run_topology,
+    run_topology_frr_only_truth,
     run_topology_sim_only,
 )
 from harness.tools.batfish import run_batfish
@@ -202,6 +205,18 @@ def _print_result(result) -> None:
     ),
 )
 @click.option(
+    "--frr-only-truth",
+    "frr_only_truth",
+    is_flag=True,
+    help=(
+        "Auto-detect FRR-only topologies eligible for containerlab ground truth "
+        "(pure FRR/Cumulus, <=20 nodes). Eligible topologies run the full 3-way "
+        "pipeline (truth T vs Batfish B vs Hammerhead H); ineligible ones fall "
+        "back to sim-only. Mutually exclusive with --sim-only. Requires Docker "
+        "+ containerlab on a Linux host for the truth-bearing subset."
+    ),
+)
+@click.option(
     "--trials",
     type=int,
     default=5,
@@ -231,6 +246,7 @@ def bench(
     no_hammerhead: bool,
     keep_lab_on_failure: bool,
     sim_only: bool,
+    frr_only_truth: bool,
     trials: int,
     verbose: bool,
 ) -> None:
@@ -251,6 +267,13 @@ def bench(
     exits non-zero if any topology was not passed.
     """
     _setup_logging(verbose)
+
+    if sim_only and frr_only_truth:
+        click.echo(
+            "bench: --sim-only and --frr-only-truth are mutually exclusive",
+            err=True,
+        )
+        sys.exit(2)
 
     if trials < 1:
         click.echo(f"bench: --trials must be >= 1, got {trials}", err=True)
@@ -281,6 +304,12 @@ def bench(
     if sim_only:
         _run_bench_sim_only(
             selected, hooks=hooks, results_dir=results_dir, trials=trials
+        )
+        return
+
+    if frr_only_truth:
+        _run_bench_frr_only_truth(
+            selected, hooks=hooks, results_dir=results_dir
         )
         return
 
@@ -368,6 +397,155 @@ def _run_bench_sim_only(
         f"summary -> {results_dir / 'bench_summary.json'}"
     )
     sys.exit(0 if not failed else 1)
+
+
+def _run_bench_frr_only_truth(
+    selected: list[TopologySpec],
+    *,
+    hooks: BenchHooks,
+    results_dir: Path,
+) -> None:
+    """FRR-only-truth bench loop.
+
+    Eligible topologies (pure FRR/Cumulus, <=20 nodes) run the 3-way pipeline;
+    ineligible ones fall back to sim-only. The resulting per-topology JSON
+    keeps a ``truth_source`` discriminator so the markdown renderer can
+    split the table.
+    """
+    from harness.topology import frr_only_truth_eligible  # noqa: PLC0415
+
+    results: list[FrrOnlyTruthResult] = []
+    failed: list[str] = []
+    three_way: list[ThreeWayAgreement] = []
+    sim_only_agrees: list[SimOnlyAgreement] = []
+
+    for spec in selected:
+        workdir = results_dir / "workdir" / spec.name
+        eligible = frr_only_truth_eligible(spec)
+        click.echo(
+            f"[bench frr-only-truth] topology={spec.name} "
+            f"eligible={'yes' if eligible else 'no (fallback: sim-only)'}"
+        )
+        try:
+            result = run_topology_frr_only_truth(
+                spec,
+                workdir=workdir,
+                results_dir=results_dir,
+                hooks=hooks,
+            )
+        except Exception as exc:  # noqa: BLE001 — bench catch-all
+            click.echo(
+                f"[bench frr-only-truth] {spec.name}: {type(exc).__name__}: {exc}",
+                err=True,
+            )
+            failed.append(spec.name)
+            continue
+        results.append(result)
+        _write_frr_only_truth_result(result, results_dir)
+        _print_frr_only_truth_result(result)
+        if result.status != "passed":
+            failed.append(spec.name)
+        if result.three_way_agreement is not None:
+            three_way.append(result.three_way_agreement)
+        if result.sim_only_agreement is not None:
+            sim_only_agrees.append(result.sim_only_agreement)
+
+    summary: dict = {
+        "mode": "frr_only_truth",
+        "topology_count": len(selected),
+        "with_truth_count": len(three_way),
+        "sim_only_fallback_count": len(sim_only_agrees),
+        "failed_topologies": failed,
+    }
+    if sim_only_agrees:
+        summary["sim_only_summary"] = aggregate_sim_only(sim_only_agrees)
+    if three_way:
+        summary["three_way_details"] = [a.as_dict() for a in three_way]
+    (results_dir / "bench_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    click.echo(
+        f"[bench frr-only-truth] done. "
+        f"{len(selected) - len(failed)}/{len(selected)} passed; "
+        f"{len(three_way)} with truth, {len(sim_only_agrees)} sim-only fallback. "
+        f"summary -> {results_dir / 'bench_summary.json'}"
+    )
+    sys.exit(0 if not failed else 1)
+
+
+def _write_frr_only_truth_result(result: FrrOnlyTruthResult, results_dir: Path) -> None:
+    """Write a per-topology frr-only-truth run to ``<results_dir>/<topology>.json``.
+
+    Carries both ``three_way_agreement`` and ``sim_only_agreement`` — exactly
+    one is non-null depending on whether the topology was eligible. The
+    ``truth_source`` top-level field is the primary discriminator; readers
+    that don't care about the split can just index on ``agreement`` (which
+    resolves to whichever is set).
+    """
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    def _rel(p: Path | None) -> str | None:
+        if p is None:
+            return None
+        try:
+            return str(Path(p).resolve().relative_to(results_dir.resolve()))
+        except ValueError:
+            return str(p)
+
+    if result.three_way_agreement is not None:
+        agreement_payload: dict | None = result.three_way_agreement.as_dict()
+    elif result.sim_only_agreement is not None:
+        agreement_payload = result.sim_only_agreement.as_dict()
+    else:
+        agreement_payload = None
+
+    payload = {
+        "topology": result.topology,
+        "status": result.status,
+        "mode": "frr_only_truth",
+        "truth_source": result.truth_source,
+        "started_iso": result.started_iso,
+        "finished_iso": result.finished_iso,
+        "vendor_truth_path": _rel(result.vendor_truth_path),
+        "batfish_path": _rel(result.batfish_path),
+        "hammerhead_path": _rel(result.hammerhead_path),
+        "diff_path": _rel(result.diff_path),
+        "agreement": agreement_payload,
+        "three_way_agreement": (
+            result.three_way_agreement.as_dict()
+            if result.three_way_agreement
+            else None
+        ),
+        "sim_only_agreement": (
+            result.sim_only_agreement.as_dict()
+            if result.sim_only_agreement
+            else None
+        ),
+        "error": result.error,
+        "notes": result.notes,
+    }
+    (results_dir / f"{result.topology}.json").write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def _print_frr_only_truth_result(result: FrrOnlyTruthResult) -> None:
+    status_word = result.status.upper()
+    color = {"PASSED": "green", "FAILED": "red"}.get(status_word, "white")
+    suffix = f" (truth={result.truth_source})" if result.truth_source else " (sim-only)"
+    click.echo(click.style(f"[{status_word}] {result.topology}{suffix}", fg=color, bold=True))
+    if result.error:
+        click.echo(f"  error: {result.error}")
+    if result.three_way_agreement is not None:
+        a = result.three_way_agreement
+        click.echo(
+            f"  T={a.truth_routes} B={a.batfish_routes} H={a.hammerhead_routes} routes. "
+            f"B vs T nh={a.batfish_vs_truth_next_hop:.1%}, "
+            f"H vs T nh={a.hammerhead_vs_truth_next_hop:.1%}, "
+            f"B vs H nh={a.batfish_vs_hammerhead_next_hop:.1%}"
+        )
+    elif result.sim_only_agreement is not None:
+        a = result.sim_only_agreement
+        click.echo(
+            f"  B={a.batfish_routes} H={a.hammerhead_routes} routes. "
+            f"nh_agree={a.next_hop_agreement:.1%}"
+        )
 
 
 def _write_sim_only_result(result: SimOnlyResult, results_dir: Path) -> None:

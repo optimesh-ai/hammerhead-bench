@@ -87,6 +87,48 @@ all 16 topologies**. Absolute cell counts, per-trial wall-clocks
 `results/<topology>.json`; the rolled-up aggregate is in
 `results/bench_summary.json`.
 
+### 1.1 Ground-truth agreement (FRR subset)
+
+`hammerhead-bench bench --frr-only-truth` extends the sim-only
+diff into a 3-way comparison — *vendor truth T* (extracted from a
+live containerlab deployment of the rendered configs), *Batfish
+B*, and *Hammerhead H* — on the subset of topologies that are
+runnable against FRR / Cumulus only. A topology qualifies when
+every node's adapter kind is `frr` or `cumulus_vx`, the node
+count is ≤ 20 (the containerlab laptop ceiling we carve in at
+`harness/topology.py:FRR_ONLY_TRUTH_MAX_NODES`), and the spec
+does not use the `external_renderer` escape hatch. Topologies
+outside that subset (mixed-vendor snapshots, fat-tree k=64,
+spine-leaf-100node, …) fall back to sim-only in the same run
+and appear with `truth_source: null` in
+`results/<topology>.json`. The 3-way triad is
+`batfish_vs_truth`, `hammerhead_vs_truth`, `batfish_vs_hammerhead`;
+each triad carries the same four metrics as the sim-only
+agreement (`presence`, `next_hop`, `protocol`, `bgp_attr`) on
+the `|X ∩ Y| / |X ∪ Y|` and `|X ∩ Y|` denominators defined in
+§ 2.
+
+**Scope note.** The table below is a placeholder: this
+macOS laptop cannot run containerlab (Docker + veth requires
+Linux), so the 3-way path returns `containerlab_unsupported`
+for every row. We publish ground-truth numbers only from a
+Linux CI run — not by hand-assembled claims. When the Linux
+run lands, this subsection will carry a populated 8-column
+table (`Topology`, `T routes`, `B routes`, `H routes`,
+`B vs T presence`, `H vs T presence`, `B vs T NH`,
+`H vs T NH`) alongside the existing § 1 two-way table.
+
+| Topology | T routes | B routes | H routes | B vs T presence | H vs T presence | B vs T NH | H vs T NH |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| *TBD — populated on Linux CI* | — | — | — | — | — | — | — |
+
+The `--frr-only-truth` mode is mutually exclusive with
+`--sim-only` (the CLI exits non-zero if both are passed). All
+other existing flags (`--only`, `--trials`, `--out`, …) work as
+before. Topologies that fall back to sim-only keep their
+existing JSON shape byte-for-byte, so downstream consumers of
+the sim-only run are not affected.
+
 ## 2. Agreement metric (formal definition)
 
 Let `B` and `H` denote the per-topology sets of routes installed

@@ -822,6 +822,381 @@ def _read_stat(path: Path, key: str) -> float | None:
         return None
 
 
+# ---- FRR-only ground-truth path (Issue 4) --------------------------------
+
+
+@dataclass(slots=True)
+class ThreeWayAgreement:
+    """Three-way agreement (vendor truth T ↔ Batfish B ↔ Hammerhead H).
+
+    Only materialised by ``run_topology_frr_only_truth`` when the topology is
+    eligible for containerlab ground-truth collection (FRR / Cumulus only,
+    ≤ :data:`harness.topology.FRR_ONLY_TRUTH_MAX_NODES` nodes). Non-eligible
+    topologies fall back to the plain :class:`SimOnlyAgreement` shape with
+    ``truth_source == None`` so a single corpus-level result JSON can mix
+    truth and sim-only rows without a schema flag.
+
+    Field semantics:
+
+    * ``truth_routes`` — count of ``(node, vrf, prefix)`` keys in the vendor
+      FIB for this topology (collected via ``FrrAdapter.extract_fib``).
+    * ``*_vs_*_{next_hop,protocol,bgp_attr}`` — fraction of cells in the
+      intersection of the two sides where the relation holds.
+      Denominators are set-size-independent per pair: the denominator is
+      ``|X ∩ Y|`` for ``X_vs_Y_next_hop`` etc. See ``harness/diff/metrics.py``
+      for the exact arithmetic (reused verbatim, 1.0 on empty-intersection).
+    * ``*_vs_*_presence`` — Jaccard ``|X ∩ Y| / |X ∪ Y|``.
+    * ``*_vs_*_coverage`` — alias for ``presence`` so the JSON shape matches
+      the per-topology sim-only agreement (lets the report table reuse the
+      same column helpers).
+    * ``truth_source`` — always ``"containerlab-frr"`` for this dataclass.
+      Non-eligible topologies set the attribute to ``None`` on the enclosing
+      run result (not on this object, which only exists when truth ran).
+
+    The B ↔ H triad (``batfish_vs_hammerhead_*``) re-exposes the sim-only
+    agreement metrics so downstream consumers can index on one dataclass
+    rather than juggling two.
+    """
+
+    topology: str
+    truth_source: str = "containerlab-frr"
+
+    # Raw counts + timing
+    truth_routes: int = 0
+    batfish_routes: int = 0
+    hammerhead_routes: int = 0
+    truth_simulate_s: float | None = None
+    batfish_wall_s: float | None = None
+    hammerhead_wall_s: float | None = None
+    batfish_simulate_s: float | None = None
+    hammerhead_simulate_s: float | None = None
+
+    # B vs T
+    batfish_vs_truth_both_keys: int = 0
+    batfish_vs_truth_union_keys: int = 0
+    batfish_vs_truth_presence: float = 1.0
+    batfish_vs_truth_next_hop: float = 1.0
+    batfish_vs_truth_protocol: float = 1.0
+    batfish_vs_truth_bgp_attr: float = 1.0
+
+    # H vs T
+    hammerhead_vs_truth_both_keys: int = 0
+    hammerhead_vs_truth_union_keys: int = 0
+    hammerhead_vs_truth_presence: float = 1.0
+    hammerhead_vs_truth_next_hop: float = 1.0
+    hammerhead_vs_truth_protocol: float = 1.0
+    hammerhead_vs_truth_bgp_attr: float = 1.0
+
+    # B vs H (re-exported from the sim-only agreement shape)
+    batfish_vs_hammerhead_both_keys: int = 0
+    batfish_vs_hammerhead_union_keys: int = 0
+    batfish_vs_hammerhead_presence: float = 1.0
+    batfish_vs_hammerhead_next_hop: float = 1.0
+    batfish_vs_hammerhead_protocol: float = 1.0
+    batfish_vs_hammerhead_bgp_attr: float = 1.0
+
+    def as_dict(self) -> dict:
+        from dataclasses import asdict  # noqa: PLC0415
+
+        d = asdict(self)
+        # Presence-aliased keys so the markdown renderer can treat the
+        # three triads uniformly.
+        d["batfish_vs_truth_coverage"] = self.batfish_vs_truth_presence
+        d["hammerhead_vs_truth_coverage"] = self.hammerhead_vs_truth_presence
+        d["batfish_vs_hammerhead_coverage"] = self.batfish_vs_hammerhead_presence
+        return d
+
+
+@dataclass(slots=True)
+class FrrOnlyTruthResult:
+    """Outcome of one ``run_topology_frr_only_truth`` pass.
+
+    The container can carry either a :class:`ThreeWayAgreement` (topology was
+    eligible + truth collection succeeded) or a :class:`SimOnlyAgreement`
+    (topology was ineligible for truth → fell back to sim-only). The
+    ``truth_source`` attribute is the single discriminator downstream
+    consumers should check.
+    """
+
+    topology: str
+    status: str  # "passed" | "failed"
+    started_iso: str
+    finished_iso: str
+    truth_source: str | None = None  # "containerlab-frr" | None (sim-only fallback)
+    vendor_truth_path: Path | None = None
+    batfish_path: Path | None = None
+    hammerhead_path: Path | None = None
+    diff_path: Path | None = None
+    three_way_agreement: ThreeWayAgreement | None = None
+    sim_only_agreement: SimOnlyAgreement | None = None
+    error: str | None = None
+    notes: list[str] = field(default_factory=list)
+
+
+# Type alias: a callable that, given (spec, workdir, results_dir), writes one
+# ``<node>__<vrf>.json`` per (node, vrf) under
+# ``results_dir/vendor_truth/<topology>/`` and returns nothing. The production
+# path uses :func:`_default_truth_collector` (clab deploy + FRR adapter); tests
+# inject a fake that stamps out hand-built FIBs.
+TruthCollector = Callable[[TopologySpec, Path, Path], None]
+
+
+def _default_truth_collector(
+    spec: TopologySpec,
+    workdir: Path,
+    results_dir: Path,
+) -> None:
+    """Production truth collector: clab deploy → converge → extract → destroy.
+
+    Re-uses the existing :func:`run_topology` machinery so the container /
+    convergence / extraction logic stays in one place. Raises on any failure
+    so ``run_topology_frr_only_truth`` can fall back or propagate.
+
+    Only called on Linux (checked by the caller — macOS falls back to
+    sim-only). Containerlab + Docker must be on ``PATH``.
+    """
+    result = run_topology(
+        spec,
+        workdir=workdir,
+        results_dir=results_dir,
+        hooks=BenchHooks(),  # no batfish/hammerhead yet — those run later
+    )
+    if result.status != "passed":
+        raise RuntimeError(
+            f"truth collection failed for {spec.name}: {result.error}"
+        )
+
+
+def run_topology_frr_only_truth(
+    spec: TopologySpec,
+    *,
+    workdir: Path,
+    results_dir: Path,
+    hooks: BenchHooks | None = None,
+    truth_collector: TruthCollector | None = None,
+) -> FrrOnlyTruthResult:
+    """Run one topology under the ``--frr-only-truth`` pipeline.
+
+    Semantics:
+
+    * If :func:`harness.topology.frr_only_truth_eligible` returns ``False``,
+      fall back to :func:`run_topology_sim_only` and record
+      ``truth_source = None`` in the result.
+    * Otherwise, collect vendor truth via ``truth_collector`` (default:
+      :func:`_default_truth_collector` — containerlab-backed),
+      run Batfish + Hammerhead on the same rendered configs, and compute
+      the three-way agreement triad (B↔T, H↔T, B↔H).
+
+    Tests pass a mock ``truth_collector`` that stamps out hand-built FIBs
+    directly into ``results_dir/vendor_truth/<topology>/``; the real one
+    requires Docker + containerlab on a Linux host.
+    """
+    from harness.topology import frr_only_truth_eligible  # noqa: PLC0415
+
+    started = _now_iso()
+    hooks = hooks or BenchHooks()
+
+    if not frr_only_truth_eligible(spec):
+        # Fall back: run the sim-only path, wrap the result so the shape is
+        # uniform across eligible / ineligible topologies.
+        sim_result = run_topology_sim_only(
+            spec,
+            workdir=workdir,
+            results_dir=results_dir,
+            hooks=hooks,
+        )
+        return FrrOnlyTruthResult(
+            topology=spec.name,
+            status=sim_result.status,
+            started_iso=sim_result.started_iso,
+            finished_iso=sim_result.finished_iso,
+            truth_source=None,
+            batfish_path=sim_result.batfish_path,
+            hammerhead_path=sim_result.hammerhead_path,
+            diff_path=sim_result.diff_path,
+            sim_only_agreement=sim_result.agreement,
+            error=sim_result.error,
+            notes=list(sim_result.notes),
+        )
+
+    # Eligible path: collect truth + run simulators + three-way diff.
+    import time as _time  # noqa: PLC0415
+
+    collector = truth_collector or _default_truth_collector
+    vt_dir = results_dir / "vendor_truth" / spec.name
+    bf_dir = results_dir / "batfish" / spec.name
+    hh_dir = results_dir / "hammerhead" / spec.name
+    diff_dir = results_dir / "diff_frr_only_truth" / spec.name
+
+    result = FrrOnlyTruthResult(
+        topology=spec.name,
+        status="failed",
+        started_iso=started,
+        finished_iso=started,
+        truth_source="containerlab-frr",
+    )
+
+    try:
+        # Rendering has to happen before truth collection so the truth
+        # collector has configs to push onto the containers.
+        log.info("[%s] rendering configs (frr-only-truth)", spec.name)
+        render_topology(spec, workdir)
+        configs_dir = workdir / "configs"
+
+        log.info("[%s] collecting containerlab vendor truth", spec.name)
+        t_truth_0 = _time.monotonic()
+        collector(spec, workdir, results_dir)
+        truth_wall = _time.monotonic() - t_truth_0
+        result.vendor_truth_path = vt_dir
+
+        # Run Batfish + Hammerhead against the same configs_dir.
+        bf_wall: float | None = None
+        hh_wall: float | None = None
+        if hooks.batfish is not None:
+            bf_dir.mkdir(parents=True, exist_ok=True)
+            log.info("[%s] running batfish (frr-only-truth)", spec.name)
+            t0 = _time.monotonic()
+            hooks.batfish(configs_dir, bf_dir, spec.name)
+            bf_wall = _time.monotonic() - t0
+            result.batfish_path = bf_dir
+        if hooks.hammerhead is not None:
+            hh_dir.mkdir(parents=True, exist_ok=True)
+            log.info("[%s] running hammerhead (frr-only-truth)", spec.name)
+            t0 = _time.monotonic()
+            hooks.hammerhead(configs_dir, hh_dir, spec.name)
+            hh_wall = _time.monotonic() - t0
+            result.hammerhead_path = hh_dir
+
+        bf_sim = _read_stat(bf_dir / "batfish_stats.json", "total_s")
+        hh_sim = _read_stat(hh_dir / "hammerhead_stats.json", "total_s")
+
+        agreement = _compute_three_way_agreement(
+            spec=spec,
+            results_dir=results_dir,
+            diff_dir=diff_dir,
+            filter_loopback_host=hooks.filter_loopback_host,
+            truth_wall_s=truth_wall,
+            batfish_wall_s=bf_wall,
+            hammerhead_wall_s=hh_wall,
+            batfish_simulate_s=bf_sim,
+            hammerhead_simulate_s=hh_sim,
+        )
+        result.three_way_agreement = agreement
+        result.diff_path = diff_dir
+        result.status = "passed"
+    except Exception as exc:  # noqa: BLE001 — pipeline is the top-level catch-all
+        result.error = f"{type(exc).__name__}: {exc}"
+        log.error("[%s] frr-only-truth failed: %s", spec.name, result.error)
+    finally:
+        result.finished_iso = _now_iso()
+    return result
+
+
+def _compute_three_way_agreement(
+    *,
+    spec: TopologySpec,
+    results_dir: Path,
+    diff_dir: Path,
+    filter_loopback_host: bool,
+    truth_wall_s: float | None,
+    batfish_wall_s: float | None,
+    hammerhead_wall_s: float | None,
+    batfish_simulate_s: float | None,
+    hammerhead_simulate_s: float | None,
+) -> ThreeWayAgreement:
+    """Diff all three pairs, persist records + agreement.json.
+
+    Pure index-pair diffs; re-uses the sim-only index helper for consistency
+    with the head-to-head path. Writes ``agreement.json`` + ``records.json``
+    under ``diff_dir`` so the report renderer has a stable artifact location.
+    """
+    import json  # noqa: PLC0415
+
+    workspace = load_fib_workspace(results_dir, spec.name)
+    truth_ix = _sim_only_index(workspace.vendor, filter_loopback_host)
+    batfish_ix = _sim_only_index(workspace.batfish, filter_loopback_host)
+    hammer_ix = _sim_only_index(workspace.hammerhead, filter_loopback_host)
+
+    bt = _pairwise_agreement(batfish_ix, truth_ix)
+    ht = _pairwise_agreement(hammer_ix, truth_ix)
+    bh = _pairwise_agreement(batfish_ix, hammer_ix)
+
+    agreement = ThreeWayAgreement(
+        topology=spec.name,
+        truth_source="containerlab-frr",
+        truth_routes=len(truth_ix),
+        batfish_routes=len(batfish_ix),
+        hammerhead_routes=len(hammer_ix),
+        truth_simulate_s=truth_wall_s,
+        batfish_wall_s=batfish_wall_s,
+        hammerhead_wall_s=hammerhead_wall_s,
+        batfish_simulate_s=batfish_simulate_s,
+        hammerhead_simulate_s=hammerhead_simulate_s,
+        batfish_vs_truth_both_keys=bt["both"],
+        batfish_vs_truth_union_keys=bt["union"],
+        batfish_vs_truth_presence=bt["presence"],
+        batfish_vs_truth_next_hop=bt["next_hop"],
+        batfish_vs_truth_protocol=bt["protocol"],
+        batfish_vs_truth_bgp_attr=bt["bgp_attr"],
+        hammerhead_vs_truth_both_keys=ht["both"],
+        hammerhead_vs_truth_union_keys=ht["union"],
+        hammerhead_vs_truth_presence=ht["presence"],
+        hammerhead_vs_truth_next_hop=ht["next_hop"],
+        hammerhead_vs_truth_protocol=ht["protocol"],
+        hammerhead_vs_truth_bgp_attr=ht["bgp_attr"],
+        batfish_vs_hammerhead_both_keys=bh["both"],
+        batfish_vs_hammerhead_union_keys=bh["union"],
+        batfish_vs_hammerhead_presence=bh["presence"],
+        batfish_vs_hammerhead_next_hop=bh["next_hop"],
+        batfish_vs_hammerhead_protocol=bh["protocol"],
+        batfish_vs_hammerhead_bgp_attr=bh["bgp_attr"],
+    )
+
+    diff_dir.mkdir(parents=True, exist_ok=True)
+    (diff_dir / "agreement.json").write_text(json.dumps(agreement.as_dict(), indent=2) + "\n")
+    return agreement
+
+
+def _pairwise_agreement(ix_x: dict, ix_y: dict) -> dict[str, float | int]:
+    """Compute agreement counts for two pre-indexed FIB dicts.
+
+    Returns a dict with keys ``both`` (int), ``union`` (int), ``presence``
+    (Jaccard, float), ``next_hop`` / ``protocol`` / ``bgp_attr`` (float,
+    1.0 on empty intersection to match the sim-only convention).
+    """
+    union_keys = set(ix_x) | set(ix_y)
+    both_keys = set(ix_x) & set(ix_y)
+    nh_agree = 0
+    proto_agree = 0
+    bgp_total = 0
+    bgp_agree = 0
+    for key in both_keys:
+        x = ix_x[key]
+        y = ix_y[key]
+        if _nh_sets_equal_sim_only(x, y):
+            nh_agree += 1
+        if x.protocol == y.protocol:
+            proto_agree += 1
+        if x.protocol == "bgp" and y.protocol == "bgp":
+            bgp_total += 1
+            if (
+                _as_path_equal_sim_only(x.as_path, y.as_path)
+                and x.local_pref == y.local_pref
+                and x.med == y.med
+            ):
+                bgp_agree += 1
+    denom_both = len(both_keys) or 1
+    denom_union = len(union_keys) or 1
+    return {
+        "both": len(both_keys),
+        "union": len(union_keys),
+        "presence": len(both_keys) / denom_union if union_keys else 1.0,
+        "next_hop": nh_agree / denom_both if both_keys else 1.0,
+        "protocol": proto_agree / denom_both if both_keys else 1.0,
+        "bgp_attr": bgp_agree / bgp_total if bgp_total else 1.0,
+    }
+
+
 def aggregate_sim_only(per_topology: list[SimOnlyAgreement]) -> dict:
     """Bench summary with both naive and coverage-honest agreement means.
 
