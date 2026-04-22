@@ -408,10 +408,26 @@ class SimOnlyAgreement:
     batfish_simulate_s: float | None = None
     hammerhead_simulate_s: float | None = None
 
+    @property
+    def coverage(self) -> float:
+        """Jaccard overlap |B \u2229 H| / |B \u222a H|.
+
+        0.0 when a simulator fails outright (e.g. Batfish parser crashes
+        and emits zero routes) and 1.0 when both sides produce identical
+        key sets. Reviewers should read :attr:`next_hop_agreement` only
+        in conjunction with :attr:`coverage` \u2014 an agreement rate of
+        1.0 over 0 shared rows is not a claim, it's a vacuous truth.
+        """
+        if self.union_keys == 0:
+            return 1.0
+        return self.both_sides_keys / self.union_keys
+
     def as_dict(self) -> dict:
         from dataclasses import asdict  # noqa: PLC0415
 
-        return asdict(self)
+        d = asdict(self)
+        d["coverage"] = self.coverage
+        return d
 
 
 @dataclass(slots=True)
@@ -659,7 +675,26 @@ def _read_stat(path: Path, key: str) -> float | None:
 
 
 def aggregate_sim_only(per_topology: list[SimOnlyAgreement]) -> dict:
-    """Simple mean across topologies for the head-to-head bench summary."""
+    """Bench summary with both naive and coverage-honest agreement means.
+
+    Two reductions are emitted side-by-side:
+
+    * ``*_agreement_mean`` is the arithmetic mean over *all* topologies,
+      treating a zero-intersection topology (e.g. Batfish parser failure
+      \u2192 0 routes) as 1.0 \u2014 a vacuous truth that flatters the
+      headline. Kept for backward-compatibility with existing
+      ``results/bench_summary.json`` consumers.
+
+    * ``*_agreement_mean_covered`` is the mean over only those
+      topologies where ``both_sides_keys > 0``. This is the honest
+      reduction: it excludes topologies where no meaningful comparison
+      could happen. Reviewers should quote this number alongside the
+      ``covered_topology_count`` so the denominator is explicit.
+
+    ``mean_coverage`` is the arithmetic mean of per-topology Jaccard
+    coverage; a low value flags how much of the summary is running on
+    empty intersections.
+    """
     n = len(per_topology)
     if n == 0:
         return {"topology_count": 0}
@@ -667,11 +702,24 @@ def aggregate_sim_only(per_topology: list[SimOnlyAgreement]) -> dict:
     def _mean(xs: list[float]) -> float:
         return sum(xs) / len(xs) if xs else 1.0
 
+    covered = [a for a in per_topology if a.both_sides_keys > 0]
+
     return {
         "topology_count": n,
+        "covered_topology_count": len(covered),
+        "mean_coverage": _mean([a.coverage for a in per_topology]),
         "next_hop_agreement_mean": _mean([a.next_hop_agreement for a in per_topology]),
         "protocol_agreement_mean": _mean([a.protocol_agreement for a in per_topology]),
         "bgp_attr_agreement_mean": _mean([a.bgp_attr_agreement for a in per_topology]),
+        "next_hop_agreement_mean_covered": _mean(
+            [a.next_hop_agreement for a in covered]
+        ),
+        "protocol_agreement_mean_covered": _mean(
+            [a.protocol_agreement for a in covered]
+        ),
+        "bgp_attr_agreement_mean_covered": _mean(
+            [a.bgp_attr_agreement for a in covered]
+        ),
         "total_batfish_routes": sum(a.batfish_routes for a in per_topology),
         "total_hammerhead_routes": sum(a.hammerhead_routes for a in per_topology),
         "total_batfish_wall_s": sum(a.batfish_wall_s or 0.0 for a in per_topology),

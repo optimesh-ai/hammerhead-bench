@@ -493,6 +493,103 @@ def _docker_run(argv: list[str]) -> tuple[int, str, str]:  # pragma: no cover - 
     return p.returncode, p.stdout, p.stderr
 
 
+# Batfish has no standalone FRR parser (RANCID tag "frr" maps to UNSUPPORTED
+# in VendorConfigurationFormatDetector). The only way to reach Batfish's
+# FRR grammar is via CUMULUS_CONCATENATED, triggered by the marker
+# `# This file describes the network interfaces`. Without the wrap, our
+# raw frr.conf is misdetected as CISCO_IOS (because `interface X` is the
+# CISCO_LIKE_PATTERN giveaway); the IOS parser then mis-extracts some
+# routes on topologies without `update-source lo` and crashes with a
+# NullPointerException on topologies that do have it. Wrap every FRR
+# config in a Cumulus-concatenated envelope with a synthesized
+# `/etc/network/interfaces` section derived from the frr.conf's own
+# interface blocks.
+_FRR_VERSION = "8.4.1"
+
+
+def _looks_like_frr(path: Path) -> bool:
+    """True if the first ~500 bytes contain an unmistakable FRR marker."""
+    try:
+        head = path.read_text(errors="ignore")[:512]
+    except OSError:
+        return False
+    return ("frr defaults" in head) or head.startswith("frr version")
+
+
+def _wrap_frr_as_cumulus_concatenated(body: str, hostname: str) -> str:
+    """Wrap an ``frr.conf`` body so Batfish parses it via CUMULUS_CONCATENATED.
+
+    The returned string follows Batfish's canonical concatenated layout
+    (derived from its own ``bgp_neighbor_undefined_routemap`` /
+    ``interface_test`` test fixtures):
+
+      1. bare hostname on the first line (no ``# /etc/hostname`` header)
+      2. ``# This file describes the network interfaces`` — lexer marker
+         that opens the ``/etc/network/interfaces`` section
+      3. one ``iface`` stanza per interface mentioned in the FRR config,
+         with single-space-indented ``address`` lines; ``lo`` gets
+         ``iface lo inet loopback``, everything else bare ``iface X``
+      4. ``# ports.conf --`` — lexer marker that opens
+         ``/etc/cumulus/ports.conf`` (content may be empty)
+      5. ``frr version ...`` — lexer marker that opens
+         ``/etc/frr/frr.conf``; the original body follows
+    """
+    iface_ips: dict[str, list[str]] = {}
+    current_iface: str | None = None
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("interface ") and not line.startswith(" "):
+            current_iface = stripped.split(None, 1)[1].strip()
+            iface_ips.setdefault(current_iface, [])
+        elif current_iface is not None and stripped.startswith("ip address "):
+            addr = stripped.split(None, 2)[2].strip()
+            if addr:
+                iface_ips[current_iface].append(addr)
+        elif not line.startswith(" ") and stripped and not stripped.startswith("!"):
+            current_iface = None
+
+    lines: list[str] = []
+    lines.append(hostname)
+    lines.append("# This file describes the network interfaces")
+    lines.append("")
+    # lo first, then the rest sorted for determinism.
+    ordered = sorted(iface_ips.keys(), key=lambda n: (n != "lo", n))
+    for iface in ordered:
+        if iface == "lo":
+            lines.append(f"iface {iface} inet loopback")
+        else:
+            lines.append(f"iface {iface}")
+        for addr in iface_ips[iface]:
+            lines.append(f" address {addr}")
+        lines.append("")
+    lines.append("# ports.conf --")
+    lines.append("")
+    # `frr version ...` is the grammar's delimiter for the frr.conf
+    # sub-section; prepend one only if the body doesn't already start
+    # with one.
+    head = body.splitlines()[:3]
+    if not any(l.startswith("frr version") for l in head):
+        lines.append(f"frr version {_FRR_VERSION}")
+    lines.append(body.rstrip("\n"))
+    return "\n".join(lines) + "\n"
+
+
+def _stage_config(src: Path, dst: Path, kind: str | None) -> None:
+    """Copy ``src`` to ``dst``, wrapping FRR configs for Batfish when needed.
+
+    For FRR configs, emit a CUMULUS_CONCATENATED envelope so Batfish
+    selects its FRR grammar instead of the Cisco IOS fallback.
+    Non-FRR kinds pass through to a plain copy, since their real
+    vendor headers already unambiguously identify the format.
+    """
+    if kind == "frr":
+        body = src.read_text()
+        hostname = dst.stem
+        dst.write_text(_wrap_frr_as_cumulus_concatenated(body, hostname))
+        return
+    shutil.copyfile(src, dst)
+
+
 def run_batfish(
     configs_dir: Path,
     out_dir: Path,
@@ -537,13 +634,21 @@ def run_batfish(
                     # first one that matches our known set; Batfish auto-detects
                     # vendor from content once it's named <device>.cfg.
                     picked = None
-                    for candidate in ("frr.conf", "startup-config", "running-config", "config.boot", "config"):
+                    picked_kind: str | None = None
+                    for candidate, kind in (
+                        ("frr.conf", "frr"),
+                        ("startup-config", "arista"),
+                        ("running-config", None),
+                        ("config.boot", "juniper"),
+                        ("config", None),
+                    ):
                         p = child / candidate
                         if p.is_file():
                             picked = p
+                            picked_kind = kind
                             break
                     if picked is not None:
-                        shutil.copyfile(picked, stage_cfg_dir / f"{child.name}.cfg")
+                        _stage_config(picked, stage_cfg_dir / f"{child.name}.cfg", picked_kind)
                         continue
                     # AWS describe-* JSON snapshot lives in configs/aws/. Batfish
                     # expects aws_configs/ at the snapshot root.
@@ -553,7 +658,9 @@ def run_batfish(
                         for aws_file in sorted(child.glob("*.json")):
                             shutil.copyfile(aws_file, aws_stage / aws_file.name)
                 elif child.is_file() and child.suffix in {".cfg", ".conf"}:
-                    shutil.copyfile(child, stage_cfg_dir / child.name)
+                    # Top-level file (rare): sniff content for FRR markers.
+                    kind = "frr" if _looks_like_frr(child) else None
+                    _stage_config(child, stage_cfg_dir / child.name, kind)
             session.init_snapshot(str(stage_root), name=f"bench-{topology}", overwrite=True)
         init_s = time.monotonic() - t_init
 

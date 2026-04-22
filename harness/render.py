@@ -41,8 +41,24 @@ def render_topology(spec: TopologySpec, workdir: Path) -> Path:
     Returns the path to the clab YAML so the caller can ``containerlab deploy -t``
     it immediately. Creates ``workdir`` if missing. Overwrites any existing
     rendered files so reruns are idempotent.
+
+    If ``spec.external_renderer`` is set, the Jinja path is skipped entirely
+    and the callable is invoked with ``workdir / "configs"`` so it can
+    populate the layout directly. That mode is intended for synthetic
+    large-scale fixtures (fat-tree k=64, enterprise_10000, ...) that are
+    impractical to express as tuples of ``Node`` + ``Link``. sim-only
+    runs are the only supported path for externally-rendered topologies;
+    ``workdir / "topology.clab.yml"`` is still touched (empty) so callers
+    that blindly return its path don't crash on ``FileNotFoundError``.
     """
     workdir.mkdir(parents=True, exist_ok=True)
+    if spec.external_renderer is not None:
+        configs_dir = workdir / "configs"
+        configs_dir.mkdir(parents=True, exist_ok=True)
+        spec.external_renderer(configs_dir)
+        clab_path = workdir / "topology.clab.yml"
+        clab_path.write_text("# external_renderer topology — sim-only only\n")
+        return clab_path
     env = _build_env(spec)
     clab_path = _render_clab_yaml(spec, env, workdir)
     for node in spec.nodes:

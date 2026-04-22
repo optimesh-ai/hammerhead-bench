@@ -21,6 +21,7 @@ Design notes:
 from __future__ import annotations
 
 import importlib.util
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -79,6 +80,19 @@ class TopologySpec:
     """Directory holding ``topology.clab.yml.j2`` + vendor config templates."""
 
     description: str = ""
+
+    external_renderer: Callable[[Path], None] | None = None
+    """Optional escape hatch for topologies too large to model as tuples of
+    ``Node`` + ``Link``. When set, the harness renders the topology by
+    invoking ``external_renderer(configs_dir)`` — the callable is expected
+    to populate ``configs_dir`` with ``<host>.cfg`` (EOS / flat) or
+    ``<host>/frr.conf`` (FRR / subdir) files in the same layout the
+    Batfish + Hammerhead hooks already consume. The Jinja path is skipped
+    entirely. sim-only mode is the only supported path in that case: no
+    clab YAML is rendered so ``run_topology`` (with-truth) will still
+    fail loudly on a missing ``topology.clab.yml.j2`` unless the caller
+    implements it themselves.
+    """
 
     def node(self, name: str) -> Node:
         """Return the node with the given name; raise KeyError if missing."""
