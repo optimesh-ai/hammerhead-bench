@@ -62,21 +62,28 @@ loopback host routes that Hammerhead elides — a documented
 modeling difference rather than a simulator disagreement
 (§ 3 "Route-count asymmetry").
 
-**Aggregate over the corpus.** The headline aggregate is the
-unweighted mean of per-topology `fair_ratio` across all 16 topologies
-(definition in § 2): **mean = 232×** (median 223×, range **168×** at
-4-node IS-IS to **362×** at 20-node spine-leaf, n=16). The
-corresponding unweighted-mean `wall_ratio` (includes Batfish JVM +
-snapshot upload) is **694×**; post-migration (see § 3, "Harness
-migration history") the `asym_ratio` lower bound collapses onto
-`fair_ratio` because the Hammerhead-side RIB materialization step is
-now inside the single `simulate --emit-rib all` call the numerator
-measures. We do not recommend citing any single aggregate as a
-headline speedup number without qualification; § 3 explains the
-regime structure — ratios still contract with topology size on the
-`wall_ratio` axis because Batfish's fixed ~22 s init cost amortizes
-over larger solves, but the `fair_ratio` curve is now much flatter
-than it was under the per-device-rib harness.
+**Aggregate over the corpus.** `results/bench_summary.json`
+reports three reductions of the per-topology `fair_ratio`
+side-by-side (§ 2.4): `arithmetic_mean` (legacy baseline),
+`geometric_mean` (multiplicative-scale central tendency — the one
+reviewers should cite as "typical ratio"), and
+`workload_weighted_mean` (route-count-weighted — pulls the headline
+toward production-scale topologies and damps small-rig noise). On
+the 16-topology corpus the arithmetic `fair_ratio` mean is **232×**
+(median 223×, range **168×** at 4-node IS-IS to **362×** at 20-node
+spine-leaf, n=16); the `geometric_mean` and `workload_weighted_mean`
+columns in the summary JSON are what we cite when we need one
+number. The corresponding arithmetic `wall_ratio` (includes Batfish
+JVM + snapshot upload) is **694×**; post-migration (see § 3,
+"Harness migration history") the `asym_ratio` lower bound collapses
+onto `fair_ratio` because the Hammerhead-side RIB materialization
+step is now inside the single `simulate --emit-rib all` call the
+numerator measures. We do not recommend citing any single aggregate
+as a headline speedup number without qualification; § 3 explains
+the regime structure — ratios still contract with topology size on
+the `wall_ratio` axis because Batfish's fixed ~22 s init cost
+amortizes over larger solves, but the `fair_ratio` curve is now
+much flatter than it was under the per-device-rib harness.
 
 **Agreement.** On the intersection of (node, vrf, prefix) cells
 installed by both tools (the `|B ∩ H|` column in the per-topology
@@ -141,13 +148,15 @@ the sim-only run are not affected.
 
 ## 2. Agreement metric (formal definition)
 
+### 2.1 Cell-level equality
+
 Let `B` and `H` denote the per-topology sets of routes installed
 by Batfish and Hammerhead respectively, each route identified by
-its key `(n, v, p)` ∈ Nodes × VRFs × Prefixes. We measure
-agreement only on `B ∩ H` — cells where both simulators installed
-some route for the same key on the same node in the same VRF.
-For each such cell, we define (exactly as implemented in
-`harness/diff/engine.py`):
+its key `(n, v, p) ∈ Nodes × VRFs × Prefixes`. We measure cell-
+level agreement only on `B ∩ H` — cells where both simulators
+installed some route for the same key on the same node in the
+same VRF. For each such cell, we define (exactly as implemented
+in `harness/diff/engine.py`):
 
 - **`nh_agree(n, v, p)`** — let `NH_t(n,v,p) = {(ip_i, iface_i)}`
   be the *set* of `(ip, interface)` pairs produced by tool `t` at
@@ -158,9 +167,9 @@ For each such cell, we define (exactly as implemented in
   "no next-hop IP" / "null interface" does not manufacture a
   disagreement. Then `nh_agree := NH_B == NH_H` as
   `frozenset` equality.
-- **`proto_agree(n, v, p)`** — `protocol(B) == protocol(H)` as
-  a string equality on the canonicalized protocol code emitted
-  by the respective harness adapter (`bgp`, `ospf`, `isis`,
+- **`proto_agree(n, v, p)`** — `protocol(B) == protocol(H)` as a
+  string equality on the canonicalized protocol code emitted by
+  the respective harness adapter (`bgp`, `ospf`, `isis`,
   `static`, `connected`, etc.).
 - **`bgp_attrs_agree(n, v, p)`** — defined only on cells where
   both sides report protocol `bgp`. Let
@@ -169,71 +178,202 @@ For each such cell, we define (exactly as implemented in
   (LOCAL_PREF(B) == LOCAL_PREF(H)) ∧ (MED(B) == MED(H))`. The
   `AS_PATH` comparison is length- and order-sensitive list
   equality; `None` matches `None` but `None` does not match `[]`.
-- **`presence_agree(t)`** — per-topology Jaccard overlap on the
-  key sets, measuring *which rows both tools produced at all*
-  independent of any inner-field equality. Formally, with
-  `K_B(t) := { (n, v, p) : B(t) has a route at (n, v, p) }` and
-  `K_H(t)` analogously,
-  `presence_agree(t) := |K_B(t) ∩ K_H(t)| / |K_B(t) ∪ K_H(t)|`
-  with the convention `presence_agree(t) := 1.0` when
-  `|K_B(t) ∪ K_H(t)| = 0` (no rows on either side — a vacuous
-  truth, not a claim). This is surfaced in
-  `agreement.presence` (and the identically-valued alias
-  `agreement.coverage`) in every `results/<topology>.json`
-  and as the `Presence` column in the § 1 table. It is the
-  sim-only analogue of the 3-way `presence_match_rate` the
-  vendor-truth path reports against live FRR / cEOS; see
-  `harness/diff/metrics.py` for the 3-way shape.
 
-**Fair speedup ratio.** The headline timing comparison reported in
-§ 1 is the *fair ratio*, defined as
+### 2.2 Presence Jaccard + Reference Canonicalizer
+
+**Raw presence.** Per-topology Jaccard overlap on the key sets,
+measuring *which rows both tools produced at all* independent of
+any inner-field equality. With `K_B(t) := { (n, v, p) : B(t) has
+a route at (n, v, p) }` and `K_H(t)` analogously,
+
+```
+presence_strict(t) := |K_B(t) ∩ K_H(t)| / |K_B(t) ∪ K_H(t)|
+```
+
+with `presence_strict(t) := 1.0` when `|K_B(t) ∪ K_H(t)| = 0`
+(vacuous truth, not a claim). This is surfaced in every
+`results/<topology>.json` as `agreement.presence_strict` +
+`agreement.union_keys_strict` + `agreement.both_sides_keys_strict`.
+
+**Reference Canonicalizer (symmetric /32 loopback reconciliation).**
+FRR's zebra installs a `<loopback-ip>/32` host route for every
+loopback interface, and Batfish additionally materializes the
+IGP-advertised `/32` on every neighbour that sees the loopback
+via IS-IS or OSPF. Hammerhead models loopbacks as prefix
+originators rather than reinstalled destinations and elides those
+`/32` entries. That is a modelling asymmetry, not a disagreement
+on routing outcome, so comparing the two tools on `K_B` vs. `K_H`
+directly penalises whichever one is more conservative about
+re-installing its own loopbacks.
+
+The Reference Canonicalizer is the symmetric post-process that
+addresses the gap. Let `L(r)` be the predicate "route `r` is a
+`/32` whose protocol is `connected` / `local` with a `lo*`
+interface next-hop, OR whose protocol is `isis` / `ospf`". The
+canonicalizer operates on the `K_B \ K_H` and `K_H \ K_B`
+residues with three policies:
+
+- **`LoopbackPolicy.STRIP`** — default. For every asymmetric
+  `(n, v, p) ∈ (K_B △ K_H)` with `L` holding for the route that
+  *does* appear, drop the key from *both* indexes. The diff is
+  then computed on the symmetric residue, and presence / next-hop
+  / protocol agreement never blame the tool that modelled the
+  loopback more conservatively.
+- **`LoopbackPolicy.MATERIALIZE`** — completionist view. For
+  every asymmetric `(n, v, p)` with `L` holding, insert a copy on
+  the missing side so the row enters `K_B ∩ K_H`. Informational
+  only — the mirrored rows agree with themselves trivially, so
+  next-hop agreement under this policy is not a correctness
+  claim.
+- **`LoopbackPolicy.PASSTHROUGH`** — no reconciliation, legacy
+  behaviour preserved. Yields the Batfish-favouring upper bound
+  on the presence gap.
+
+The reconciled Jaccard is
+
+```
+presence(t) := |K_B'(t) ∩ K_H'(t)| / |K_B'(t) ∪ K_H'(t)|
+```
+
+where `K_X'(t)` is `K_X(t)` after the Reference Canonicalizer
+ran under the selected policy. `presence(t) := 1.0` on empty
+union, same vacuous-truth convention as raw presence. Every
+per-topology JSON carries both `presence` and `presence_strict`
+plus the integer count of rows the reconciler moved
+(`loopback_reconciled_count`), so a reviewer can always audit
+how much of the headline presence agreement came from
+reconciliation vs. raw overlap.
+
+### 2.3 Fair speedup ratio
+
+**Infrastructure overhead vs. solver latency.** Batfish sits
+behind a JVM + Jetty stack that takes ~18–22 s to reach REST
+readiness on our host. The harness can run Batfish two ways:
+cold (one container per trial, JVM cold-start paid every time)
+or warm (one container per bench run via `BatfishService`, JVM
+cold-start paid once). Both regimes are legitimate — cold mirrors
+"operator re-snapshots a live network from scratch", warm mirrors
+"operator re-queries the same snapshot in a running Batfish".
+The sim-only path runs warm by default (`--persistent-batfish`,
+toggled off with `--no-persistent-batfish`) and reports both the
+first-trial `batfish_simulate_s_cold` and the mean over
+subsequent warm trials (`batfish_simulate_s_warm_mean`) so the
+reader can see the JVM cold-start tax separate from the
+steady-state solve. `batfish_container_start_s` is the one-off
+`docker run` + `wait_ready` cost attributed to the first trial
+only.
+
+**Fair ratio (headline).** With equivalent work on each side:
 
 ```
 fair_ratio(t) := (batfish_query_routes_s + batfish_query_bgp_s)
-               / (hammerhead_simulate_s   + hammerhead_rib_total_s)
+               / (hammerhead_simulate_s  + hammerhead_rib_total_s)
 ```
 
-Both numerator and denominator measure the analogous unit of work:
-"compute the converged RIB for every (node, vrf, prefix) cell and
-materialize it in a form the downstream diff engine can read." The
-numerator sums Batfish's inner `InitRoutesQuestion` +
-`BgpRibQuestion` times (pybatfish-reported, excluding JVM startup
-and snapshot upload). The denominator sums Hammerhead's `simulate`
-subcommand (control-plane convergence) and the `rib` subcommand
-(RIB dump in the shared schema). We treat this as the canonical
-headline because it measures the same two-phase pipeline on both
-sides: (1) run the protocol fixed-point solvers; (2) materialize
-the per-cell output.
+- Numerator: the inner `InitRoutesQuestion` +
+  `BgpRibQuestion` times reported by pybatfish. Excludes
+  `docker run`, JVM / Jetty readiness, and snapshot upload
+  (`batfish_init_snapshot_s`, reported separately on the Batfish
+  sidecar so reviewers can see the architectural cost of the
+  snapshot-upload step that Hammerhead doesn't have).
+- Denominator: Hammerhead's inner solver (`simulate_s`) plus
+  per-device RIB materialization (`rib_total_s`, zero in the
+  post-b46eb45 bulk-emit migration because RIB is folded into
+  `simulate --emit-rib all`).
 
-The alternative `asym_ratio(t) := bf_solve / hh_simulate` (sometimes
-rendered in older JSON as `solve_ratio`) is a **Hammerhead-favoring
-lower bound**: it charges Batfish for its full inner solve but
-charges Hammerhead only for the solver, not for the RIB
-materialization step that produces the comparable output. Every
-`results/<topology>.json` therefore carries an `asym_ratio_note`
-sibling field with the literal string
-`"Hammerhead-favoring lower bound; see README §2. Do not cite as
-headline."` so downstream consumers of the JSON cannot cite it
-unaware of the caveat. We retain `asym_ratio` in the per-topology
-record (under the canonical name plus the legacy alias `solve_ratio`
-for back-compat) because it is informative when a reader wants to
-understand how much of a headline `fair_ratio` gap is solver
-performance vs. the harness shape of the materialization step. The
-reverse-direction aggregate (`wall_ratio := bf_wall / hh_wall`)
-includes JVM startup + snapshot upload on the Batfish side and the
-full harness fork-exec + subprocess overhead on the Hammerhead side;
-it is an upper bound on the ratio from a production operator's
-point of view, and it is the column rendered next to `fair_ratio`
-in the § 1 table.
+Both numerator and denominator measure the analogous unit of
+work — "compute the converged RIB for every (n, v, p) cell and
+materialize it" — on the same two-phase pipeline shape. This is
+the ratio reviewers should cite. When someone wants
+"what speedup does an operator see end-to-end on a fresh
+container?" the `wall_ratio` column beside it is the right
+number; see below.
 
-Per-topology agreement is the unweighted cell-level mean of each
-relation over `B ∩ H` (over BGP-cells for `bgp_attrs_agree`).
-The aggregate row in the table of § 1 is the mean across
-topologies, not weighted by cell count — this was chosen so that
-a single large topology does not dominate the headline number.
-Raw cell counts for each topology are in
-`results/<topology>.json` under the `agreement.cells_compared`
-field for each axis.
+**Asym ratio (lower bound, retained for audit).** Pairing
+Batfish's fused query+materialize against Hammerhead's solver
+alone is Hammerhead-favouring — it charges Batfish for the
+RIB-materialization step Hammerhead's numerator doesn't include.
+We retain it as
+
+```
+asym_ratio(t) := (batfish_query_routes_s + batfish_query_bgp_s)
+               /  hammerhead_simulate_s
+```
+
+solely so a reviewer can see how much of a headline gap is
+solver performance vs. materialization-step shape. Every
+`results/<topology>.json` carries an `asym_ratio_note` sibling
+field stating verbatim that it is a lower bound. Post-b46eb45
+the two ratios converge (`rib_total_s == 0` in the bulk-emit
+path) so the caveat is a schema-stability breadcrumb rather
+than an active warning.
+
+**Wall ratio (upper bound, operator-facing).** The reverse-
+direction aggregate
+
+```
+wall_ratio(t) := batfish_wall_s / hammerhead_wall_s
+```
+
+includes JVM cold-start + snapshot upload on the Batfish side
+and the full harness fork-exec + subprocess overhead on the
+Hammerhead side. On the persistent-service path `batfish_wall_s`
+is the per-trial wall minus the amortised container start cost,
+so `wall_ratio` under `--persistent-batfish` is closer to the
+fair ratio than the `--no-persistent-batfish` version. Both are
+surfaced in the JSON.
+
+### 2.4 Corpus aggregates
+
+Every `results/bench_summary.json` carries three reductions of
+each ratio side-by-side — the reader picks the one their
+question calls for:
+
+- **`arithmetic_mean`** — `sum(ratios) / n`. Legacy baseline;
+  sensitive to small-topology noise (a 2-node rig's 20 ms
+  wall-time has ±50 % jitter that dominates a 16-sample mean).
+- **`geometric_mean`** — `exp(mean(log(ratios)))`, computed in
+  log space for numerical stability. Unbiased central tendency
+  on a multiplicative scale, and the one reviewers should cite
+  as "typical ratio" when the corpus spans multiple orders of
+  magnitude (our wall-ratio range is 156× to 884×).
+- **`workload_weighted_mean`** — `Σ w_i r_i / Σ w_i` with `w_i`
+  equal to the Batfish-side route count. Pulls the headline
+  toward production-scale topologies and damps small-rig noise.
+  The right reduction for "what speedup does an operator see on
+  a real fabric?".
+
+The summary additionally surfaces `median`, `p25`, `p75`, `min`,
+`max`, and the full `samples` list so a reviewer can reconstruct
+any reduction without re-reading per-topology JSON. Failed
+topologies (ratio undefined, non-positive, or non-finite) are
+moved to `excluded` with the exclusion reason verbatim, and
+their samples never feed any reducer.
+
+### 2.5 Memory (peak RSS)
+
+Both sidecars now carry `peak_rss_mb` + `peak_rss_source` +
+`peak_rss_sample_count`. Batfish's peak is sampled via a
+background `docker stats --no-stream` poller on the running
+container while the solve window is active; Hammerhead's peak
+is `resource.getrusage(RUSAGE_CHILDREN).ru_maxrss` taken around
+the `simulate --emit-rib all` subprocess, normalised to MB
+(bytes on Darwin/BSD, kilobytes on Linux). Both paths are
+best-effort — `None` means the sampler was disabled
+(`HAMMERHEAD_BENCH_DISABLE_PEAK_RSS=1`) or the reading was
+unavailable; we never fake a zero. The per-trial mean rolls up
+into `SimOnlyAgreement.batfish_peak_rss_mb` and
+`SimOnlyAgreement.hammerhead_peak_rss_mb`; provenance (first
+non-empty `peak_rss_source` across trials and the summed
+`peak_rss_sample_count`) rides alongside on the same dataclass so
+a reviewer can tell a 1-sample `rusage` point-in-time reading from
+an N-sample `docker-stats` max-over-window. The corpus-level
+`batfish_peak_rss_summary` + `hammerhead_peak_rss_summary` blocks
+in `results/bench_summary.json` carry `max_mb` / `mean_mb` /
+`source` / `sample_count` / `topology_count` across the run, with
+`source: "mixed"` as a sentinel if topologies ever disagree on
+sampler provenance — so the headline memory figures are one JSON
+hop from the summary, not a walk of `topology_details`.
 
 **What this does not claim.** Agreement between two simulators
 is not correctness: if both tools misinterpret the same route-
@@ -564,11 +704,18 @@ Beyond the threats in § 3:
   `fair_ratio`. Scale-regime readers should weight the
   20-/50-/100-node rows more heavily than the 2-/3-/4-node rows
   when extrapolating to production-sized fabrics.
-- **We do not measure peak RSS in sim-only mode.** The header
-  of § 1 is wall-clock-only. `--with-truth` mode does
-  measure RSS; sim-only does not, because the Batfish-in-
-  Docker memory accounting is confounded by JVM overhead
-  that is not attributable to any specific solve.
+- **Peak RSS instrumentation is best-effort.** Both sidecars
+  now carry `peak_rss_mb` / `peak_rss_source` /
+  `peak_rss_sample_count`. Batfish samples via `docker stats
+  --no-stream` on a background poller (source
+  `"docker-stats"`), Hammerhead via `resource.getrusage(
+  RUSAGE_CHILDREN)` around the subprocess (source
+  `"rusage"`). Readings can drop to `None` when the sampler is
+  disabled (`HAMMERHEAD_BENCH_DISABLE_PEAK_RSS=1`), the
+  container exits inside the first poll window, or the platform
+  doesn't ship `resource`. A reviewer who sees `peak_rss_mb ==
+  null` with a non-zero `peak_rss_sample_count` should treat it
+  as measurement noise, not a bench bug.
 - **We do not measure accuracy against vendor truth for all
   topologies.** `--with-truth` is implemented but requires
   cEOS-lab for 2 of the 16 topologies; we leave the

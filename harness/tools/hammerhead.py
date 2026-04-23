@@ -63,6 +63,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from harness.peak_rss import PeakRssReading, peak_rss_enabled, rusage_peak_mb
 from harness.tools.hammerhead_transform import transform_rib_view
 
 __all__ = [
@@ -108,6 +109,20 @@ class HammerheadStats:
       simulate_s`` — i.e. ``fair_ratio`` and ``asym_ratio`` converge
       post-migration. See ``pipeline.py::ASYM_RATIO_NOTE`` and
       README § 2 for the formal discussion.
+    * ``peak_rss_mb`` — peak resident-set size of the
+      ``hammerhead simulate`` subprocess in MB, sampled via
+      ``resource.getrusage(RUSAGE_CHILDREN).ru_maxrss`` across the
+      ``rn.simulate_emit_rib_all`` window. ``None`` when sampling was
+      disabled (``HAMMERHEAD_BENCH_DISABLE_PEAK_RSS=1``) or the
+      reading was unavailable (Windows, zero-rusage). Symmetric with
+      ``BatfishStats.peak_rss_mb``.
+    * ``peak_rss_source`` — ``"rusage"`` in production; ``None`` when
+      ``peak_rss_mb`` is ``None``. Propagated into reports so readers
+      see which sampler produced the number.
+    * ``peak_rss_sample_count`` — number of successful readings that
+      fed ``peak_rss_mb``. For ``rusage`` this is 1 (one pre/post
+      pair); for the docker-stats sampler on the Batfish side it's
+      the poll count. Zero iff ``peak_rss_mb is None``.
     """
 
     topology: str
@@ -117,6 +132,9 @@ class HammerheadStats:
     device_count: int
     total_routes: int
     total_s: float
+    peak_rss_mb: int | None = None
+    peak_rss_source: str | None = None
+    peak_rss_sample_count: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -252,7 +270,15 @@ def run_hammerhead(
     t0 = time.monotonic()
 
     t_sim = time.monotonic()
-    bulk = rn.simulate_emit_rib_all(cfg, configs_dir)
+    if peak_rss_enabled():
+        body_result, peak_reading = rusage_peak_mb(
+            lambda: rn.simulate_emit_rib_all(cfg, configs_dir),
+            source="rusage",
+        )
+        bulk = body_result  # type: ignore[assignment]
+    else:
+        bulk = rn.simulate_emit_rib_all(cfg, configs_dir)
+        peak_reading = PeakRssReading(mb=None, sample_count=0, source="rusage")
     sim_s = time.monotonic() - t_sim
 
     rib_map = _extract_rib_map(bulk)
@@ -291,6 +317,9 @@ def run_hammerhead(
         device_count=len(hostnames),
         total_routes=total_routes,
         total_s=time.monotonic() - t0,
+        peak_rss_mb=peak_reading.mb,
+        peak_rss_source=peak_reading.source if peak_reading.mb is not None else None,
+        peak_rss_sample_count=peak_reading.sample_count,
     )
     (out_dir / "hammerhead_stats.json").write_text(
         json.dumps(stats.as_dict(), indent=2) + "\n"

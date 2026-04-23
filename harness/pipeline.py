@@ -29,6 +29,7 @@ from pathlib import Path
 from harness.adapters.bridge import BridgeAdapter
 from harness.adapters.ceos import CeosAdapter
 from harness.adapters.frr import FrrAdapter
+from harness.aggregate import LoopbackPolicy
 from harness.clab import ClabDriver, ClabError, DeployedLab, RealClab
 from harness.diff.engine import DiffRecord, diff_fibs, load_fib_workspace
 from harness.diff.metrics import TopologyMetrics, aggregate
@@ -75,6 +76,28 @@ class TopologyRunResult:
 BatfishHook = Callable[[Path, Path, str], None]
 HammerheadHook = Callable[[Path, Path, str], None]
 
+# A "persistent" Batfish hook. Unlike the plain ``BatfishHook`` callable
+# (which pays JVM cold-start per invocation) a persistent hook keeps the
+# Batfish container alive across multiple invocations, so a
+# ``--trials N`` loop amortises the ~20 s JVM + Jetty readiness cost
+# across the whole loop instead of paying it N times. The pipeline
+# detects a persistent hook by duck-typing on a ``run_one`` method
+# (:meth:`harness.tools.batfish.BatfishService.run_one`); plain callables
+# continue to work unchanged for backward compatibility.
+
+
+class _PersistentBatfishProtocol:
+    """Structural duck type for a persistent Batfish service.
+
+    Matches :class:`harness.tools.batfish.BatfishService` without having
+    to import it here (keeps pipeline free of a hard dependency on the
+    tools-layer module for unit tests that stub the service).
+    """
+
+    def run_one(  # pragma: no cover — protocol surface, implemented elsewhere
+        self, configs_dir: Path, out_dir: Path, *, topology: str
+    ) -> object: ...
+
 
 @dataclass(slots=True)
 class BenchHooks:
@@ -85,15 +108,59 @@ class BenchHooks:
     pipeline runs it against the rendered ``configs/`` directory and writes
     per-(node, vrf) JSON under ``results/<sim>/<topology>/``.
 
-    ``filter_loopback_host`` threads straight to ``diff_fibs`` so the three
-    FIB sources are compared on the same footing (FRR emits /32 host routes
-    for its loopbacks; Batfish doesn't; Hammerhead's Rust side follows
-    Batfish's convention).
+    ``batfish_service`` is the persistent-service escape hatch. When set,
+    the sim-only trial loop calls ``service.run_one(...)`` instead of the
+    per-trial cold-container ``batfish`` callable, so JVM cold-start is
+    paid once per bench run rather than once per trial. ``batfish`` and
+    ``batfish_service`` are mutually exclusive; if both are set the
+    pipeline prefers the service and logs a warning.
+
+    Loopback handling is driven by the three-valued :class:`LoopbackPolicy`
+    enum (imported from :mod:`harness.aggregate`).
+    ``filter_loopback_host: bool`` is the legacy knob retained for
+    back-compat with pre-LoopbackPolicy tests; when ``loopback_policy`` is
+    ``None`` (the default) :meth:`effective_loopback_policy` falls back
+    to :meth:`LoopbackPolicy.from_bool` on the bool. The policy applies
+    symmetrically to vendor / Batfish / Hammerhead FIBs:
+
+    * ``LoopbackPolicy.STRIP`` — Reference Canonicalizer, minimalist view.
+      Drops both (1) every ``lo*``-interface /32 connected/local entry
+      AND (2) every IGP-protocol /32 (IS-IS / OSPF) that appears on
+      only one of Batfish / Hammerhead (the 23 % presence gap the
+      reviewer flagged on IS-IS and OSPF corpora). Applied
+      symmetrically so the presence Jaccard reflects control-plane
+      agreement, not adapter-level /32 modelling asymmetry. Default.
+    * ``LoopbackPolicy.MATERIALIZE`` — completionist view. Keeps vendor
+      /32 host entries and mirrors asymmetric IGP /32 loopback
+      advertisements onto the opposite side so both simulators claim
+      the same presence set. Diagnostic only — the mirrored copies
+      agree with themselves trivially, so do not cite next-hop
+      agreement computed under this policy as a correctness result.
+    * ``LoopbackPolicy.PASSTHROUGH`` — every source stays as the adapter
+      emitted it. Historical behaviour preserved for compatibility;
+      the Batfish-favouring upper-bound on the presence gap.
     """
 
     batfish: BatfishHook | None = None
+    batfish_service: _PersistentBatfishProtocol | None = None
     hammerhead: HammerheadHook | None = None
     filter_loopback_host: bool = True
+    loopback_policy: LoopbackPolicy | None = None
+
+    def effective_loopback_policy(self) -> LoopbackPolicy:
+        """Resolve the active :class:`LoopbackPolicy`.
+
+        When ``loopback_policy`` is set explicitly it wins. When left
+        ``None`` (the default on freshly-constructed ``BenchHooks``) we
+        honour the legacy ``filter_loopback_host`` bool so existing
+        callers that pass ``filter_loopback_host=False`` continue to
+        observe PASSTHROUGH behaviour. Every diff / metric call site
+        inside the pipeline goes through this accessor so adding a new
+        surface never duplicates the two-knob compatibility logic.
+        """
+        if self.loopback_policy is not None:
+            return self.loopback_policy
+        return LoopbackPolicy.from_bool(self.filter_loopback_host)
 
 
 def run_topology(  # noqa: PLR0915 — phased pipeline; refactor scheduled for phase 10
@@ -201,7 +268,7 @@ def run_topology(  # noqa: PLR0915 — phased pipeline; refactor scheduled for p
                 spec=spec,
                 results_dir=results_dir,
                 diff_dir=diff_dir,
-                filter_loopback_host=hooks.filter_loopback_host,
+                loopback_policy=hooks.effective_loopback_policy(),
             )
             result.metrics = metrics
             result.diff_path = diff_dir
@@ -356,11 +423,11 @@ def _compute_diff(
     spec: TopologySpec,
     results_dir: Path,
     diff_dir: Path,
-    filter_loopback_host: bool,
+    loopback_policy: LoopbackPolicy,
 ) -> TopologyMetrics:
     """Load the three FIB sources, diff them, persist records + metrics."""
     workspace = load_fib_workspace(results_dir, spec.name)
-    records = diff_fibs(workspace, filter_loopback_host=filter_loopback_host)
+    records = diff_fibs(workspace, loopback_policy=loopback_policy)
     metrics = aggregate(spec.name, records)
 
     diff_dir.mkdir(parents=True, exist_ok=True)
@@ -449,6 +516,55 @@ class SimOnlyAgreement:
     # query fires. Hammerhead has no equivalent — it reads configs from
     # disk directly — so the field is Batfish-side only.
     batfish_init_snapshot_s: float | None = None
+    # Warm-vs-cold JVM measurements. When a persistent :class:`BatfishService`
+    # is used, only the first trial pays the JVM / Jetty readiness cost
+    # (``container_start_s``); every subsequent trial reuses the running
+    # container. We report the cold-first ``simulate_s`` and the mean of
+    # the remaining warm trials as a pair so reviewers can see the
+    # infrastructure overhead separately from the steady-state solve.
+    # ``batfish_simulate_s_warm_mean`` is None when either no trial ran
+    # warm (i.e. legacy cold-per-trial path) or no warm trials were
+    # collected (i.e. trials=1 on the persistent path). The "cold"
+    # companion is always the first trial's simulate_s.
+    batfish_simulate_s_warm_mean: float | None = None
+    batfish_simulate_s_cold: float | None = None
+    batfish_container_start_s: float | None = None
+    # Peak RSS (MB) for each simulator. Batfish's peak is sampled via
+    # ``docker stats`` on the container while the solve runs; Hammerhead's
+    # peak is the subprocess' ru_maxrss sampled via a child-process
+    # psutil sampler. Mean across trials; None when the sampler was
+    # disabled or unavailable on the host. See Objective 4.
+    batfish_peak_rss_mb: float | None = None
+    hammerhead_peak_rss_mb: float | None = None
+    # Provenance for the two peak_rss_mb scalars above. ``source`` is
+    # the string the sampler stamped on the reading — ``"docker-stats"``
+    # for Batfish's container-side poller, ``"rusage"`` for Hammerhead's
+    # ``getrusage(RUSAGE_CHILDREN)`` window — verbatim so the report
+    # renderer can surface the measurement method without hard-coding
+    # which tool uses which sampler. ``None`` when no trial produced a
+    # reading (sampler disabled / binary absent / container died early).
+    # ``sample_count`` is the *sum* across trials: for rusage it equals
+    # the number of successful trials (1 per trial); for docker-stats
+    # it is the total successful poll count (a 5-trial run polling at
+    # 250 ms over a ~20 s solve window reports ~400 samples). Zero
+    # iff ``source is None``.
+    batfish_peak_rss_source: str | None = None
+    batfish_peak_rss_sample_count: int = 0
+    hammerhead_peak_rss_source: str | None = None
+    hammerhead_peak_rss_sample_count: int = 0
+    # Reference-canonicalizer breadcrumbs. Let reviewers see the raw,
+    # un-reconciled Jaccard (``presence_strict`` over
+    # ``union_keys_strict``) alongside the reconciled one (``presence``
+    # over ``union_keys``) plus the :class:`LoopbackPolicy` value that
+    # was in effect + how many asymmetric /32 loopback-host rows the
+    # reconciler touched. ``loopback_policy`` is the :attr:`.value`
+    # string of the enum so the JSON round-trips without a custom
+    # encoder; production default is ``"strip"``.
+    loopback_policy: str = LoopbackPolicy.STRIP.value
+    loopback_reconciled_count: int = 0
+    presence_strict: float | None = None
+    union_keys_strict: int | None = None
+    both_sides_keys_strict: int | None = None
     trials: dict | None = None
     trial_stats: dict | None = None
 
@@ -592,7 +708,7 @@ class SimOnlyResult:
     notes: list[str] = field(default_factory=list)
 
 
-def run_topology_sim_only(
+def run_topology_sim_only(  # noqa: PLR0912, PLR0915 — trial loop honours persistent service + legacy hook + per-trial sidecar fanout
     spec: TopologySpec,
     *,
     workdir: Path,
@@ -651,11 +767,31 @@ def run_topology_sim_only(
         batfish_walls: list[float] = []
         batfish_sims: list[float] = []
         batfish_inits: list[float] = []
+        batfish_peaks: list[int] = []
+        batfish_peak_sources: list[str] = []
+        batfish_peak_samples: list[int] = []
+        batfish_warms: list[bool] = []
         hammer_walls: list[float] = []
         hammer_sims: list[float] = []
         hammer_ribs: list[float] = []
+        hammer_peaks: list[int] = []
+        hammer_peak_sources: list[str] = []
+        hammer_peak_samples: list[int] = []
 
-        if hooks.batfish is not None:
+        # Service takes precedence over the plain callable. Accepting both
+        # is intentional — tests inject a simple callable, CI plumbs a
+        # persistent service — but only one actually fires per trial.
+        bf_service = hooks.batfish_service
+        bf_callable = hooks.batfish
+        if bf_service is not None and bf_callable is not None:
+            log.warning(
+                "[%s] both batfish and batfish_service set on BenchHooks; "
+                "preferring the persistent service (warm-JVM measurements).",
+                spec.name,
+            )
+            bf_callable = None
+
+        if bf_service is not None or bf_callable is not None:
             bf_dir.mkdir(parents=True, exist_ok=True)
             result.batfish_path = bf_dir
         if hooks.hammerhead is not None:
@@ -663,10 +799,41 @@ def run_topology_sim_only(
             result.hammerhead_path = hh_dir
 
         for i in range(trials):
-            if hooks.batfish is not None:
+            if bf_service is not None:
+                log.info(
+                    "[%s] running batfish via persistent service (trial %d/%d)",
+                    spec.name, i + 1, trials,
+                )
+                t0 = _time.monotonic()
+                bf_stats = bf_service.run_one(configs_dir, bf_dir, topology=spec.name)
+                wall = _time.monotonic() - t0
+                batfish_walls.append(wall)
+                # service returns a BatfishStats dataclass — read fields
+                # directly to avoid the round-trip through the sidecar
+                # JSON, which is rewritten by every call.
+                sim_s = getattr(bf_stats, "simulate_s", None)
+                init_s = getattr(bf_stats, "init_snapshot_s", None)
+                total_s = getattr(bf_stats, "total_s", None)
+                warm = bool(getattr(bf_stats, "warm", False))
+                peak = getattr(bf_stats, "peak_rss_mb", None)
+                peak_source = getattr(bf_stats, "peak_rss_source", None)
+                peak_samples = int(getattr(bf_stats, "peak_rss_sample_count", 0) or 0)
+                _assert_simulate_le_total("batfish", spec.name, sim_s, total_s)
+                if sim_s is not None:
+                    batfish_sims.append(sim_s)
+                if init_s is not None:
+                    batfish_inits.append(init_s)
+                if peak is not None:
+                    batfish_peaks.append(int(peak))
+                if isinstance(peak_source, str) and peak_source:
+                    batfish_peak_sources.append(peak_source)
+                if peak_samples > 0:
+                    batfish_peak_samples.append(peak_samples)
+                batfish_warms.append(warm)
+            elif bf_callable is not None:
                 log.info("[%s] running batfish (trial %d/%d)", spec.name, i + 1, trials)
                 t0 = _time.monotonic()
-                hooks.batfish(configs_dir, bf_dir, spec.name)
+                bf_callable(configs_dir, bf_dir, spec.name)
                 wall = _time.monotonic() - t0
                 batfish_walls.append(wall)
                 sidecar = bf_dir / "batfish_stats.json"
@@ -678,6 +845,18 @@ def run_topology_sim_only(
                     batfish_sims.append(sim_s)
                 if init_s is not None:
                     batfish_inits.append(init_s)
+                peak = _read_stat(sidecar, "peak_rss_mb")
+                if peak is not None:
+                    batfish_peaks.append(int(peak))
+                peak_source = _read_str_stat(sidecar, "peak_rss_source")
+                peak_samples = _read_int_stat(sidecar, "peak_rss_sample_count")
+                if peak_source:
+                    batfish_peak_sources.append(peak_source)
+                if peak_samples is not None and peak_samples > 0:
+                    batfish_peak_samples.append(peak_samples)
+                # Legacy callable path: no warm/cold split available, every
+                # trial is a fresh container → mark all cold.
+                batfish_warms.append(False)
             if hooks.hammerhead is not None:
                 log.info("[%s] running hammerhead (trial %d/%d)", spec.name, i + 1, trials)
                 t0 = _time.monotonic()
@@ -699,18 +878,40 @@ def run_topology_sim_only(
                     hammer_sims.append(sim_s)
                 if rib_s is not None:
                     hammer_ribs.append(rib_s)
+                peak = _read_stat(sidecar, "peak_rss_mb")
+                if peak is not None:
+                    hammer_peaks.append(int(peak))
+                peak_source = _read_str_stat(sidecar, "peak_rss_source")
+                peak_samples = _read_int_stat(sidecar, "peak_rss_sample_count")
+                if peak_source:
+                    hammer_peak_sources.append(peak_source)
+                if peak_samples is not None and peak_samples > 0:
+                    hammer_peak_samples.append(peak_samples)
 
         agreement = _compute_sim_only_agreement(
             spec=spec,
             results_dir=results_dir,
             diff_dir=diff_dir,
-            filter_loopback_host=hooks.filter_loopback_host,
+            loopback_policy=hooks.effective_loopback_policy(),
             batfish_walls=batfish_walls,
             hammerhead_walls=hammer_walls,
             batfish_sims=batfish_sims,
             hammerhead_sims=hammer_sims,
             batfish_inits=batfish_inits,
             hammerhead_ribs=hammer_ribs,
+            batfish_peaks=batfish_peaks,
+            hammerhead_peaks=hammer_peaks,
+            batfish_peak_sources=batfish_peak_sources,
+            batfish_peak_samples=batfish_peak_samples,
+            hammerhead_peak_sources=hammer_peak_sources,
+            hammerhead_peak_samples=hammer_peak_samples,
+            batfish_warms=batfish_warms,
+            batfish_container_start_s=(
+                bf_service.container_start_s  # type: ignore[attr-defined]
+                if bf_service is not None
+                and hasattr(bf_service, "container_start_s")
+                else None
+            ),
             # Count only config-emitting nodes. Containerlab bridge adapters
             # (empty config_template_names) are L2 plumbing and don't
             # participate in routing; including them overcounts the
@@ -730,12 +931,12 @@ def run_topology_sim_only(
     return result
 
 
-def _compute_sim_only_agreement(
+def _compute_sim_only_agreement(  # noqa: PLR0912, PLR0915 — reference-canonicalizer + warm/cold split + peak-RSS rollup share one computation path
     *,
     spec: TopologySpec,
     results_dir: Path,
     diff_dir: Path,
-    filter_loopback_host: bool,
+    loopback_policy: LoopbackPolicy,
     batfish_walls: list[float],
     hammerhead_walls: list[float],
     batfish_sims: list[float],
@@ -743,6 +944,14 @@ def _compute_sim_only_agreement(
     batfish_inits: list[float] | None = None,
     hammerhead_ribs: list[float] | None = None,
     nodes: int | None = None,
+    batfish_peaks: list[int] | None = None,
+    hammerhead_peaks: list[int] | None = None,
+    batfish_peak_sources: list[str] | None = None,
+    batfish_peak_samples: list[int] | None = None,
+    hammerhead_peak_sources: list[str] | None = None,
+    hammerhead_peak_samples: list[int] | None = None,
+    batfish_warms: list[bool] | None = None,
+    batfish_container_start_s: float | None = None,
 ) -> SimOnlyAgreement:
     """Diff Batfish and Hammerhead head-to-head; write records + agreement.json.
 
@@ -750,14 +959,31 @@ def _compute_sim_only_agreement(
     the returned :class:`SimOnlyAgreement` is the arithmetic mean across
     the list, with the raw values + summary stats preserved under
     ``trials`` / ``trial_stats``.
+
+    The loopback policy is applied twice: once at the adapter layer (the
+    ``canonicalize_node_fib`` strip of ``lo*``-interface /32 connected/local
+    entries) and once at the index layer (the
+    :func:`_reconcile_loopback_host_routes` sweep of IGP-advertised /32
+    loopback residue — the historical 23 % IS-IS / OSPF presence gap).
+    The pre-reconciliation presence is preserved under ``presence_strict``
+    + ``union_keys_strict`` so reviewers can see both the minimalist
+    (strip) and completionist (materialize) views side by side.
     """
     import json  # noqa: PLC0415
 
     workspace = load_fib_workspace(results_dir, spec.name)
-    # Re-index directly; the existing diff engine treats one of the two sides
-    # as vendor truth, which would mislabel the result here.
-    batfish_ix = _sim_only_index(workspace.batfish, filter_loopback_host)
-    hammer_ix = _sim_only_index(workspace.hammerhead, filter_loopback_host)
+    batfish_ix_raw = _sim_only_index(workspace.batfish, loopback_policy)
+    hammer_ix_raw = _sim_only_index(workspace.hammerhead, loopback_policy)
+
+    strict_union = set(batfish_ix_raw) | set(hammer_ix_raw)
+    strict_both = set(batfish_ix_raw) & set(hammer_ix_raw)
+    strict_presence = (
+        len(strict_both) / len(strict_union) if strict_union else 1.0
+    )
+
+    batfish_ix, hammer_ix, reconciled_pairs = _reconcile_loopback_host_routes(
+        batfish_ix_raw, hammer_ix_raw, policy=loopback_policy
+    )
 
     union_keys = set(batfish_ix) | set(hammer_ix)
     both_keys = set(batfish_ix) & set(hammer_ix)
@@ -875,6 +1101,44 @@ def _compute_sim_only_agreement(
             "batfish_init_snapshot_s": _summarize_timings(batfish_inits or []),
         }
 
+    # Split Batfish per-trial into cold-first + warm-rest using the
+    # matching `batfish_warms` truth table the pipeline passes in. When
+    # no warm tag is available (legacy callable path) fall back to
+    # "every trial is cold". ``batfish_simulate_s_cold`` is the first
+    # trial's sim time; ``batfish_simulate_s_warm_mean`` is the mean of
+    # every subsequent warm trial's sim, or None if no warm trial
+    # happened.
+    bf_cold_sim: float | None
+    bf_warm_sim_mean: float | None
+    if batfish_warms and batfish_sims and len(batfish_warms) == len(batfish_sims):
+        warm_sims = [s for s, w in zip(batfish_sims, batfish_warms, strict=True) if w]
+        cold_sims = [s for s, w in zip(batfish_sims, batfish_warms, strict=True) if not w]
+        bf_cold_sim = cold_sims[0] if cold_sims else None
+        bf_warm_sim_mean = _mean_or_none(warm_sims)
+    else:
+        bf_cold_sim = batfish_sims[0] if batfish_sims else None
+        bf_warm_sim_mean = None
+
+    bf_peak_mean = _mean_or_none([float(x) for x in (batfish_peaks or [])])
+    hh_peak_mean = _mean_or_none([float(x) for x in (hammerhead_peaks or [])])
+    # ``source`` is stable across trials (a run can't flip from rusage to
+    # docker-stats mid-way), so collapsing to the first non-empty value
+    # is lossless. When no trial produced a reading, fall back to None
+    # even if the caller threaded an empty list through.
+    bf_peak_source = (batfish_peak_sources or [None])[0] if (batfish_peak_sources or []) else None
+    hh_peak_source = (hammerhead_peak_sources or [None])[0] if (hammerhead_peak_sources or []) else None
+    bf_peak_sample_total = sum(batfish_peak_samples or [])
+    hh_peak_sample_total = sum(hammerhead_peak_samples or [])
+    # Provenance without a value is not useful — strip the source when
+    # the mean reading is absent so downstream consumers aren't tempted
+    # to read a source string against a missing number.
+    if bf_peak_mean is None:
+        bf_peak_source = None
+        bf_peak_sample_total = 0
+    if hh_peak_mean is None:
+        hh_peak_source = None
+        hh_peak_sample_total = 0
+
     agreement = SimOnlyAgreement(
         topology=spec.name,
         batfish_routes=len(batfish_ix),
@@ -892,6 +1156,20 @@ def _compute_sim_only_agreement(
         hammerhead_rib_total_s=hh_rib_mean,
         hammerhead_simulate_plus_rib_s=hh_sim_plus_rib_mean,
         batfish_init_snapshot_s=bf_init_mean,
+        batfish_simulate_s_cold=bf_cold_sim,
+        batfish_simulate_s_warm_mean=bf_warm_sim_mean,
+        batfish_container_start_s=batfish_container_start_s,
+        batfish_peak_rss_mb=bf_peak_mean,
+        hammerhead_peak_rss_mb=hh_peak_mean,
+        batfish_peak_rss_source=bf_peak_source,
+        batfish_peak_rss_sample_count=bf_peak_sample_total,
+        hammerhead_peak_rss_source=hh_peak_source,
+        hammerhead_peak_rss_sample_count=hh_peak_sample_total,
+        loopback_policy=loopback_policy.value,
+        loopback_reconciled_count=reconciled_pairs,
+        presence_strict=strict_presence,
+        union_keys_strict=len(strict_union),
+        both_sides_keys_strict=len(strict_both),
         trials=trials_payload,
         trial_stats=stats_payload,
     )
@@ -931,17 +1209,147 @@ def _summarize_timings(xs: list[float]) -> dict[str, float] | None:
     }
 
 
-def _sim_only_index(fibs, filter_loopback_host: bool):
-    """Index FIBs by (node, vrf, prefix) → Route. Mirrors the private helper in engine.py."""
+def _sim_only_index(fibs, loopback_policy: LoopbackPolicy):
+    """Index FIBs by (node, vrf, prefix) → Route. Mirrors the private helper in engine.py.
+
+    The loopback policy drives only the adapter-level (``lo*``-interface
+    /32 connected/local) strip; the IGP-advertised /32 residue is caught
+    downstream by :func:`_reconcile_loopback_host_routes`.
+    """
     from harness.diff.engine import _RouteKey  # noqa: PLC0415
     from harness.extract.fib import canonicalize_node_fib  # noqa: PLC0415
 
     out = {}
     for raw in fibs:
-        fib = canonicalize_node_fib(raw, filter_loopback_host=filter_loopback_host)
+        fib = canonicalize_node_fib(raw, loopback_policy=loopback_policy)
         for r in fib.routes:
             out[_RouteKey(node=fib.node, vrf=fib.vrf, prefix=r.prefix)] = r
     return out
+
+
+# ---- loopback canonicalizer (Objective 2) --------------------------------
+
+
+# Protocols a /32 loopback host route can legitimately carry. Static and
+# BGP /32s are *not* loopback-hosts — those are real user-intent routes
+# that belong in the diff. IGP-advertised /32 loopbacks are the real
+# asymmetry (Batfish installs them, Hammerhead often doesn't even model
+# them as a prefix), and directly-connected / locally-originated /32s on
+# a loopback interface are the adapter-level asymmetry between FRR and
+# cEOS. Both flavours fall under this set.
+_LOOPBACK_HOST_PROTOCOLS: frozenset[str] = frozenset(
+    {"connected", "local", "isis", "ospf"}
+)
+
+
+def _looks_like_loopback_host(route) -> bool:
+    """True if a /32 route is plausibly a node-loopback advertisement.
+
+    Two shapes qualify:
+
+    1. Direct loopback: protocol is connected/local AND at least one
+       next-hop interface name starts with ``lo`` or ``loopback`` (the
+       FRR + Batfish convention for loopbacks).
+    2. IGP-advertised loopback: protocol is isis/ospf AND the prefix is
+       a /32 — Batfish installs these by default for every node's
+       loopback; Hammerhead often elides them because its data model
+       treats loopbacks as endpoint metadata, not a routable prefix.
+       The symmetric reconciliation strips these from Batfish when
+       Hammerhead doesn't carry a matching cell (and vice versa).
+
+    /32s whose protocol is BGP or static are **not** matched — those
+    are genuine user-configured routes, not a modeling asymmetry.
+    """
+    if not route.prefix.endswith("/32"):
+        return False
+    if route.protocol not in _LOOPBACK_HOST_PROTOCOLS:
+        return False
+    if route.protocol in ("connected", "local"):
+        for nh in route.next_hops:
+            if nh.interface and nh.interface.lower().startswith(("lo", "loopback")):
+                return True
+        return False
+    # protocol in {isis, ospf} — every /32 qualifies. Keeps the heuristic
+    # symmetric: we can't tell from the FIB row alone whose loopback
+    # this is, but neither can the diff engine, so we treat all IGP /32s
+    # as loopback-host candidates when they're not mirrored on the other
+    # side.
+    return True
+
+
+def _reconcile_loopback_host_routes(
+    bf_ix: dict,
+    hh_ix: dict,
+    *,
+    policy: LoopbackPolicy,
+) -> tuple[dict, dict, int]:
+    """Reference Canonicalizer: symmetric /32 loopback-host reconciliation.
+
+    This runs **after** the adapter-level :class:`LoopbackPolicy.STRIP` has
+    already dropped ``lo*``-interface connected/local /32s. The remaining
+    modelling asymmetry is the IS-IS / OSPF /32 loopback advertisement
+    gap: Batfish materializes the neighbour-advertised /32 for every
+    node's loopback, Hammerhead typically does not. This helper catches
+    that residue on top of the canonicalizer.
+
+    * :attr:`LoopbackPolicy.PASSTHROUGH` — no-op, zero reconciliations.
+      Returns the raw un-reconciled indexes. Surfaced so reviewers can
+      always inspect the Batfish-favouring upper-bound presence gap.
+    * :attr:`LoopbackPolicy.STRIP` (default) — for every /32
+      loopback-host route that is present on exactly one side, drop
+      the asymmetric row from **both** indexes. Removes the modelling
+      asymmetry tax without fabricating routes on either side. /32
+      loopback-host routes present on both sides stay put and enter
+      the normal diff.
+    * :attr:`LoopbackPolicy.MATERIALIZE` — mirror the missing side.
+      For every /32 loopback-host route present on side X but not Y,
+      insert a copy on side Y so the row enters the ``B ∩ H``
+      denominator. Informational only — the mirrored copies agree
+      with themselves trivially.
+
+    Returns ``(bf_ix, hh_ix, reconciled_pairs)``. Unknown policies
+    raise ``ValueError`` so a downstream refactor that adds a new
+    enum member without updating this helper surfaces immediately.
+    """
+    if policy is LoopbackPolicy.PASSTHROUGH:
+        return bf_ix, hh_ix, 0
+    if policy not in (LoopbackPolicy.STRIP, LoopbackPolicy.MATERIALIZE):
+        raise ValueError(
+            f"unknown loopback_policy {policy!r}; must be one of "
+            f"{{{LoopbackPolicy.STRIP!r}, {LoopbackPolicy.MATERIALIZE!r}, "
+            f"{LoopbackPolicy.PASSTHROUGH!r}}}"
+        )
+
+    only_bf = [k for k in bf_ix if k not in hh_ix]
+    only_hh = [k for k in hh_ix if k not in bf_ix]
+
+    to_strip: set = set()
+    to_mirror_on_hh: list = []
+    to_mirror_on_bf: list = []
+    for k in only_bf:
+        r = bf_ix[k]
+        if _looks_like_loopback_host(r):
+            to_strip.add(k)
+            to_mirror_on_hh.append((k, r))
+    for k in only_hh:
+        r = hh_ix[k]
+        if _looks_like_loopback_host(r):
+            to_strip.add(k)
+            to_mirror_on_bf.append((k, r))
+
+    if policy is LoopbackPolicy.STRIP:
+        bf_out = {k: v for k, v in bf_ix.items() if k not in to_strip}
+        hh_out = {k: v for k, v in hh_ix.items() if k not in to_strip}
+        return bf_out, hh_out, len(to_strip)
+
+    # policy is LoopbackPolicy.MATERIALIZE
+    bf_out = dict(bf_ix)
+    hh_out = dict(hh_ix)
+    for k, r in to_mirror_on_hh:
+        hh_out[k] = r
+    for k, r in to_mirror_on_bf:
+        bf_out[k] = r
+    return bf_out, hh_out, len(to_mirror_on_hh) + len(to_mirror_on_bf)
 
 
 def _nh_sets_equal_sim_only(a, b) -> bool:
@@ -996,6 +1404,43 @@ def _read_stat(path: Path, key: str) -> float | None:
         return None
     try:
         return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _read_str_stat(path: Path, key: str) -> str | None:
+    """Read a single string key out of a sidecar stats JSON; None if absent/empty."""
+    import json  # noqa: PLC0415
+
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return None
+    val = data.get(key)
+    if val is None:
+        return None
+    if isinstance(val, str):
+        return val or None
+    return str(val) or None
+
+
+def _read_int_stat(path: Path, key: str) -> int | None:
+    """Read a single integer key out of a sidecar stats JSON; None if absent."""
+    import json  # noqa: PLC0415
+
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return None
+    val = data.get(key)
+    if val is None:
+        return None
+    try:
+        return int(val)
     except (TypeError, ValueError):
         return None
 
@@ -1335,7 +1780,7 @@ def run_topology_frr_only_truth(
             spec=spec,
             results_dir=results_dir,
             diff_dir=diff_dir,
-            filter_loopback_host=hooks.filter_loopback_host,
+            loopback_policy=hooks.effective_loopback_policy(),
             truth_wall_s=truth_wall,
             batfish_wall_s=bf_wall,
             hammerhead_wall_s=hh_wall,
@@ -1360,7 +1805,7 @@ def _compute_three_way_agreement(
     spec: TopologySpec,
     results_dir: Path,
     diff_dir: Path,
-    filter_loopback_host: bool,
+    loopback_policy: LoopbackPolicy,
     truth_wall_s: float | None,
     batfish_wall_s: float | None,
     hammerhead_wall_s: float | None,
@@ -1374,13 +1819,17 @@ def _compute_three_way_agreement(
     Pure index-pair diffs; re-uses the sim-only index helper for consistency
     with the head-to-head path. Writes ``agreement.json`` + ``records.json``
     under ``diff_dir`` so the report renderer has a stable artifact location.
+
+    ``loopback_policy`` is applied symmetrically to all three sources so a
+    Batfish-vs-vendor ``presence`` ratio is never penalised for a /32
+    loopback-host route that the sim side didn't model.
     """
     import json  # noqa: PLC0415
 
     workspace = load_fib_workspace(results_dir, spec.name)
-    truth_ix = _sim_only_index(workspace.vendor, filter_loopback_host)
-    batfish_ix = _sim_only_index(workspace.batfish, filter_loopback_host)
-    hammer_ix = _sim_only_index(workspace.hammerhead, filter_loopback_host)
+    truth_ix = _sim_only_index(workspace.vendor, loopback_policy)
+    batfish_ix = _sim_only_index(workspace.batfish, loopback_policy)
+    hammer_ix = _sim_only_index(workspace.hammerhead, loopback_policy)
 
     bt = _pairwise_agreement(batfish_ix, truth_ix)
     ht = _pairwise_agreement(hammer_ix, truth_ix)
@@ -1504,6 +1953,86 @@ def aggregate_sim_only(per_topology: list[SimOnlyAgreement]) -> dict:
         trial_counts.pop() if len(trial_counts) == 1 else max(trial_counts, default=1)
     )
 
+    # Reviewer-survivable ratio aggregates (Objective 3). Every summary
+    # carries arithmetic + geometric + workload-weighted means side by
+    # side, plus quantiles + excluded-sample audit, so a future reader
+    # can pick the reduction that matches their scale-regime question
+    # without re-reading the per-topology JSON. Workload weight is the
+    # Batfish-side route count — the thing the solver actually computed.
+    # A zero-route topology (e.g. Batfish parser crash) still appears
+    # in ``samples`` via ``excluded`` with the exclusion reason.
+    from harness.aggregate import WeightedSample, summarize_ratios  # noqa: PLC0415
+
+    def _mk_samples(
+        getter: Callable[[SimOnlyAgreement], float | None],
+    ) -> list[WeightedSample]:
+        out: list[WeightedSample] = []
+        for a in per_topology:
+            ratio = getter(a)
+            weight = float(a.batfish_routes) if a.batfish_routes > 0 else 1.0
+            out.append(
+                WeightedSample(
+                    label=a.topology,
+                    ratio=ratio if ratio is not None else 0.0,
+                    weight=weight,
+                )
+            )
+        return out
+
+    # Corpus-level peak_rss summary (Objective 4). Per-topology JSON already
+    # carries the reading; this block lets a reader see "Batfish peaked at
+    # N MB across the corpus, sampled via <source>" without re-walking
+    # ``topology_details``. ``source`` is ``"mixed"`` when different
+    # topologies reported different sampler labels (shouldn't happen in a
+    # single bench run, but the summary is defensive).
+    def _peak_summary(
+        getter_mb: Callable[[SimOnlyAgreement], float | None],
+        getter_source: Callable[[SimOnlyAgreement], str | None],
+        getter_count: Callable[[SimOnlyAgreement], int],
+    ) -> dict:
+        mb_vals = [v for v in (getter_mb(a) for a in per_topology) if v is not None]
+        sources = sorted({s for s in (getter_source(a) for a in per_topology) if s})
+        sample_total = sum(getter_count(a) for a in per_topology)
+        if not mb_vals:
+            return {
+                "max_mb": None,
+                "mean_mb": None,
+                "source": None,
+                "sample_count": 0,
+                "topology_count": 0,
+            }
+        return {
+            "max_mb": max(mb_vals),
+            "mean_mb": sum(mb_vals) / len(mb_vals),
+            "source": sources[0] if len(sources) == 1 else ("mixed" if sources else None),
+            "sample_count": sample_total,
+            "topology_count": len(mb_vals),
+        }
+
+    batfish_peak_rss_summary = _peak_summary(
+        lambda a: a.batfish_peak_rss_mb,
+        lambda a: a.batfish_peak_rss_source,
+        lambda a: a.batfish_peak_rss_sample_count,
+    )
+    hammerhead_peak_rss_summary = _peak_summary(
+        lambda a: a.hammerhead_peak_rss_mb,
+        lambda a: a.hammerhead_peak_rss_source,
+        lambda a: a.hammerhead_peak_rss_sample_count,
+    )
+
+    fair_ratio_summary = summarize_ratios(
+        _mk_samples(lambda a: a.solve_plus_materialize_ratio()),
+        quantity="fair_ratio",
+    )
+    wall_ratio_summary = summarize_ratios(
+        _mk_samples(lambda a: a.wall_ratio()),
+        quantity="wall_ratio",
+    )
+    asym_ratio_summary = summarize_ratios(
+        _mk_samples(lambda a: a.solve_ratio()),
+        quantity="asym_ratio",
+    )
+
     return {
         "topology_count": n,
         "covered_topology_count": len(covered),
@@ -1525,5 +2054,34 @@ def aggregate_sim_only(per_topology: list[SimOnlyAgreement]) -> dict:
         "total_hammerhead_routes": sum(a.hammerhead_routes for a in per_topology),
         "total_batfish_wall_s": sum(a.batfish_wall_s or 0.0 for a in per_topology),
         "total_hammerhead_wall_s": sum(a.hammerhead_wall_s or 0.0 for a in per_topology),
+        # Reference-canonicalizer aggregate breadcrumbs. ``presence_strict``
+        # is the raw un-reconciled Jaccard mean; ``presence_reconciled``
+        # is the mean after the Reference Canonicalizer ran. When they
+        # differ substantially, the per-topology JSON's
+        # ``loopback_reconciled_count`` tells the reader how many rows
+        # the canonicalizer moved on each topology.
+        "presence_strict_mean": _mean(
+            [a.presence_strict for a in per_topology if a.presence_strict is not None]
+        ),
+        "presence_reconciled_mean": _mean([a.coverage for a in per_topology]),
+        # Headline ratios: arithmetic + geometric + workload-weighted +
+        # quantiles. ``fair_ratio_summary`` is the one the §1 headline
+        # should cite; ``wall_ratio_summary`` is the conservative
+        # upper-bound (JVM-dominated at small k); ``asym_ratio_summary``
+        # is the Hammerhead-favouring lower-bound (see README §2). All
+        # three are always emitted so consumers don't have to guess
+        # which reduction was chosen.
+        "fair_ratio_summary": fair_ratio_summary,
+        "wall_ratio_summary": wall_ratio_summary,
+        "asym_ratio_summary": asym_ratio_summary,
+        # Peak-RSS provenance block. ``source`` is the sampler label
+        # (``"docker-stats"`` for Batfish, ``"rusage"`` for Hammerhead);
+        # ``"mixed"`` iff topologies disagree. ``sample_count`` is the
+        # sum of successful readings across every topology — for rusage
+        # this equals the trial count, for docker-stats it's a function
+        # of interval_s × solve duration. ``topology_count`` is the
+        # number of topologies that produced any reading at all.
+        "batfish_peak_rss_summary": batfish_peak_rss_summary,
+        "hammerhead_peak_rss_summary": hammerhead_peak_rss_summary,
         "topology_details": [a.as_dict() for a in per_topology],
     }

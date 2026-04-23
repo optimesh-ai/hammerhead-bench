@@ -1,6 +1,6 @@
 """pybatfish wrapper — Phase 5 deliverable.
 
-Two layers:
+Three layers:
 
 1. :func:`transform_batfish_rows` — a pure function that takes
    ``routes()`` + ``bgpRib()`` row dicts (as produced by
@@ -8,14 +8,25 @@ Two layers:
    orient="records")``) and returns canonical :class:`NodeFib` rows,
    one per (node, vrf). Zero I/O. Fully test-covered.
 
-2. :func:`run_batfish` — orchestration. Starts a Batfish container via the
-   ``BatfishRunner`` protocol (default = ``DockerBatfishRunner``, which
-   shells out to ``docker run``), waits until the REST API answers, uploads
-   the snapshot via the injected :class:`BatfishSession` factory, pulls
-   ``routes()`` + ``bgpRib()`` frames, converts to NodeFibs, writes per-(node,
-   vrf) JSON files, and tears the container down. The two protocols are
-   test seams so the orchestration path is exercisable without a real
-   Batfish install.
+2. :class:`BatfishService` — a long-lived container + session. ``start()``
+   pays the JVM cold-start *once*; ``run_one(configs_dir, out_dir, topology)``
+   can then be called N times while the JVM stays warm. Per-call
+   :class:`BatfishStats` carry ``warm`` = False on the first call and
+   ``True`` on every subsequent call, so the harness can separate
+   "infrastructure overhead" (container start + REST readiness) from
+   "warm JVM solve latency" as requested by reviewers who want to see
+   the per-trial timings on a persistent service rather than a
+   per-trial cold container.
+
+3. :func:`run_batfish` — legacy one-shot orchestration. Equivalent to
+   ``with BatfishService(...) as svc: return svc.run_one(...)``. Kept
+   verbatim for backward compatibility with callers that do not want
+   to manage a persistent service (the 3-way truth path, one-off
+   smoke tests, every existing unit test).
+
+The two protocols (:class:`BatfishRunner`, :class:`BatfishSession`) are
+test seams so the orchestration path is exercisable without a real
+Batfish install.
 
 Batfish runs with ``-e _JAVA_OPTIONS=-Xmx4g`` to cap the JVM; the
 container is pinned by digest in ``versions.lock`` — the pipeline reads
@@ -29,6 +40,11 @@ Memory discipline:
   pipeline's ``sum_container_limits_mb`` math is correct when Batfish is on.
 - The container is destroyed in a ``finally`` so a failed snapshot init
   doesn't leak a running JVM.
+- Peak container RSS (Objective 4) is sampled via ``docker stats
+  --no-stream`` on a background thread while the inner solve runs; the
+  peak is surfaced in ``batfish_stats.json`` as ``peak_rss_mb``. Sampling
+  is best-effort — if ``docker stats`` is unavailable on the host the
+  field is ``None`` rather than faking a zero.
 """
 
 from __future__ import annotations
@@ -60,6 +76,7 @@ __all__ = [
     "BATFISH_MEMORY_MB",
     "BatfishConfig",
     "BatfishRunner",
+    "BatfishService",
     "BatfishSession",
     "BatfishStats",
     "DockerBatfishRunner",
@@ -379,8 +396,30 @@ class BatfishStats:
     ``simulate_s`` is the inner-solver wall-clock (``query_routes_s +
     query_bgp_s``). It excludes docker startup, JVM / Jetty boot, and
     ``init_snapshot`` upload. ``total_s`` is the outer wall-clock covering
-    everything from ``docker run`` through ``docker rm``. The gap
-    ``total_s - simulate_s - init_snapshot_s`` is the JVM/REST boot cost.
+    everything from ``docker run`` through ``docker rm`` — on a persistent
+    service this is the per-call wall, *not* the container lifetime.
+
+    ``container_start_s`` is the one-off cost of ``docker run`` +
+    :meth:`BatfishRunner.wait_ready` and is attributed in full to the
+    first call on a persistent service (``warm == False``) and zero on
+    every subsequent call (``warm == True``). The legacy one-shot
+    :func:`run_batfish` always reports ``warm == False`` because its
+    container lifetime equals one call.
+
+    ``peak_rss_mb`` is the peak RSS of the Batfish container over the
+    *solve* window (init_snapshot + query_routes + query_bgp), sampled
+    via ``docker stats --no-stream`` on a background thread. ``None`` if
+    sampling was skipped or failed; never faked to zero.
+
+    ``peak_rss_source`` is ``"docker-stats"`` in production; ``None`` when
+    ``peak_rss_mb`` is ``None``. Symmetric with
+    ``HammerheadStats.peak_rss_source`` so the report renderer can key
+    off the sampler name uniformly across tools.
+
+    ``peak_rss_sample_count`` is the number of successful ``docker stats
+    --no-stream`` readings that fed ``peak_rss_mb``. Zero iff
+    ``peak_rss_mb is None``. Used by readers to distinguish a robust
+    reading (many samples) from "container died in 50 ms" (1-2 samples).
     """
 
     topology: str
@@ -390,6 +429,11 @@ class BatfishStats:
     query_bgp_s: float
     simulate_s: float
     total_s: float
+    warm: bool = False
+    container_start_s: float = 0.0
+    peak_rss_mb: int | None = None
+    peak_rss_source: str | None = None
+    peak_rss_sample_count: int = 0
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -598,6 +642,248 @@ def _stage_config(src: Path, dst: Path, kind: str | None) -> None:
     shutil.copyfile(src, dst)
 
 
+def _stage_snapshot(configs_dir: Path, stage_root: Path) -> None:
+    """Stage ``configs_dir`` into Batfish's expected ``<root>/configs`` layout.
+
+    Mixed-vendor topologies drop a per-vendor config in each ``<device>/``
+    subdir; we pick the first file that matches our known set and rename
+    it ``<device>.cfg``. Non-FRR kinds pass through as-is; FRR configs
+    get the :func:`_wrap_frr_as_cumulus_concatenated` envelope so Batfish
+    picks its FRR grammar instead of falling back to Cisco IOS.
+    """
+    stage_cfg_dir = stage_root / "configs"
+    stage_cfg_dir.mkdir(parents=True, exist_ok=True)
+    for child in sorted(configs_dir.iterdir()):
+        if child.is_dir():
+            picked = None
+            picked_kind: str | None = None
+            for candidate, kind in (
+                ("frr.conf", "frr"),
+                ("startup-config", "arista"),
+                ("running-config", None),
+                ("config.boot", "juniper"),
+                ("config", None),
+            ):
+                p = child / candidate
+                if p.is_file():
+                    picked = p
+                    picked_kind = kind
+                    break
+            if picked is not None:
+                _stage_config(picked, stage_cfg_dir / f"{child.name}.cfg", picked_kind)
+                continue
+            # AWS describe-* JSON snapshot lives in configs/aws/. Batfish
+            # expects aws_configs/ at the snapshot root.
+            if child.name == "aws":
+                aws_stage = stage_root / "aws_configs"
+                aws_stage.mkdir(parents=True, exist_ok=True)
+                for aws_file in sorted(child.glob("*.json")):
+                    shutil.copyfile(aws_file, aws_stage / aws_file.name)
+        elif child.is_file() and child.suffix in {".cfg", ".conf"}:
+            # Top-level file (rare): sniff content for FRR markers.
+            kind = "frr" if _looks_like_frr(child) else None
+            _stage_config(child, stage_cfg_dir / child.name, kind)
+
+
+class BatfishService:
+    """Long-lived Batfish container + pybatfish session.
+
+    Purpose: eliminate the JVM cold-start tax the harness was previously
+    paying per trial. Calling :meth:`start` once and then :meth:`run_one`
+    N times amortises container start + REST readiness across the whole
+    trial loop, so ``warm`` timings reflect the "operator re-runs a
+    snapshot on a running Batfish" regime rather than the "spin up a
+    fresh container for each snapshot" regime. Both regimes are
+    legitimate; we measure both and let the reader choose — see
+    README § 2 / § 3 for the framing.
+
+    Lifecycle::
+
+        svc = BatfishService(config=..., runner=..., session_factory=...)
+        svc.start()                               # JVM cold-start once
+        stats1 = svc.run_one(cfgs_a, out_a, topology="t1")  # warm=False
+        stats2 = svc.run_one(cfgs_b, out_b, topology="t2")  # warm=True
+        svc.close()
+
+    Or as a context manager::
+
+        with BatfishService() as svc:
+            svc.run_one(...)
+
+    Idempotent — ``start()`` on a started service is a no-op; ``close()``
+    on a closed service is a no-op. The container is always torn down
+    on :meth:`close` (and on ``__exit__``) even when :meth:`run_one`
+    raises. Re-entering after ``close()`` is not supported; construct
+    a fresh :class:`BatfishService`.
+    """
+
+    __slots__ = (
+        "_cfg", "_runner", "_session_factory",
+        "_container_id", "_session", "_calls", "_container_start_s",
+        "_sample_memory",
+    )
+
+    def __init__(
+        self,
+        *,
+        config: BatfishConfig | None = None,
+        runner: BatfishRunner | None = None,
+        session_factory: Callable[[BatfishConfig], BatfishSession] | None = None,
+        sample_memory: bool = True,
+    ) -> None:
+        self._cfg = config or BatfishConfig()
+        self._runner = runner or DockerBatfishRunner()
+        self._session_factory = session_factory or _default_pybatfish_session_factory
+        self._container_id: str | None = None
+        self._session: BatfishSession | None = None
+        self._calls = 0
+        self._container_start_s = 0.0
+        self._sample_memory = sample_memory
+
+    @property
+    def container_start_s(self) -> float:
+        """Cold-start wall-clock (``docker run`` + ``wait_ready``). 0.0 before start."""
+        return self._container_start_s
+
+    @property
+    def calls(self) -> int:
+        """Number of :meth:`run_one` invocations since :meth:`start`."""
+        return self._calls
+
+    @property
+    def started(self) -> bool:
+        return self._container_id is not None
+
+    def start(self) -> None:
+        if self._container_id is not None:
+            return
+        t0 = time.monotonic()
+        self._container_id = self._runner.start(self._cfg)
+        try:
+            self._runner.wait_ready(self._cfg, self._container_id)
+            self._session = self._session_factory(self._cfg)
+        except Exception:
+            # Failed to reach ready — tear down the half-spawned container
+            # so we don't leak a running JVM on the operator's host.
+            try:
+                self._runner.stop(self._container_id)
+            except Exception as exc:  # noqa: BLE001 — stop failure is non-fatal; logged
+                log.warning("batfish: container stop failed during abort: %s", exc)
+            self._container_id = None
+            self._session = None
+            raise
+        self._container_start_s = time.monotonic() - t0
+
+    def close(self) -> None:
+        if self._container_id is None:
+            return
+        try:
+            self._runner.stop(self._container_id)
+        except Exception as exc:  # noqa: BLE001 — stop failure is non-fatal; logged
+            log.warning("batfish: container stop failed: %s", exc)
+        self._container_id = None
+        self._session = None
+
+    def __enter__(self) -> BatfishService:
+        self.start()
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def run_one(
+        self,
+        configs_dir: Path,
+        out_dir: Path,
+        *,
+        topology: str,
+    ) -> BatfishStats:
+        """Upload a snapshot, query routes + bgpRib, write per-(node,vrf) FIBs.
+
+        Returns a :class:`BatfishStats` whose ``warm`` is ``False`` on the
+        very first call since :meth:`start` (and carries the full
+        ``container_start_s`` as a startup-cost breadcrumb) and ``True``
+        thereafter. ``total_s`` is always the per-call wall-clock, never
+        the container lifetime.
+        """
+        if self._container_id is None or self._session is None:
+            self.start()
+        # Re-bind after start() so mypy/pyright see the non-None guarantee.
+        assert self._container_id is not None and self._session is not None
+
+        started_iso = time.strftime("%Y-%m-%dT%H:%M:%S+0000", time.gmtime())
+        t0 = time.monotonic()
+
+        from harness.peak_rss import DockerStatsSampler, peak_rss_enabled  # noqa: PLC0415
+
+        sampler: DockerStatsSampler | None = None
+        if self._sample_memory and peak_rss_enabled():
+            try:
+                sampler = DockerStatsSampler(container_id=self._container_id)
+                sampler.start()
+            except Exception as exc:  # noqa: BLE001 — sampler is best-effort
+                log.warning("batfish: memory sampler start failed: %s", exc)
+                sampler = None
+
+        try:
+            t_init = time.monotonic()
+            with tempfile.TemporaryDirectory(prefix="bf-snap-") as stage_root_str:
+                stage_root = Path(stage_root_str)
+                _stage_snapshot(configs_dir, stage_root)
+                self._session.init_snapshot(
+                    str(stage_root), name=f"bench-{topology}", overwrite=True
+                )
+            init_s = time.monotonic() - t_init
+
+            t_routes = time.monotonic()
+            route_rows = self._session.get_routes()
+            routes_s = time.monotonic() - t_routes
+
+            t_bgp = time.monotonic()
+            bgp_rows = self._session.get_bgp_rib()
+            bgp_s = time.monotonic() - t_bgp
+
+            fibs = transform_batfish_rows(route_rows, bgp_rows=bgp_rows)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            for fib in fibs:
+                out_path = out_dir / f"{fib.node}__{fib.vrf}.json"
+                out_path.write_text(fib.model_dump_json(indent=2) + "\n")
+        finally:
+            if sampler is not None:
+                reading = sampler.stop()
+                peak_mb = reading.mb
+                peak_source = reading.source if reading.mb is not None else None
+                peak_samples = reading.sample_count
+            else:
+                peak_mb = None
+                peak_source = None
+                peak_samples = 0
+
+        warm = self._calls > 0
+        self._calls += 1
+        stats = BatfishStats(
+            topology=topology,
+            started_iso=started_iso,
+            init_snapshot_s=init_s,
+            query_routes_s=routes_s,
+            query_bgp_s=bgp_s,
+            simulate_s=routes_s + bgp_s,
+            total_s=time.monotonic() - t0,
+            warm=warm,
+            # Attribute the full cold-start cost to the first call; zero
+            # it out thereafter so summing per-call stats across trials
+            # doesn't double-count.
+            container_start_s=0.0 if warm else self._container_start_s,
+            peak_rss_mb=peak_mb,
+            peak_rss_source=peak_source,
+            peak_rss_sample_count=peak_samples,
+        )
+        (out_dir / "batfish_stats.json").write_text(
+            json.dumps(stats.as_dict(), indent=2) + "\n"
+        )
+        return stats
+
+
 def run_batfish(
     configs_dir: Path,
     out_dir: Path,
@@ -609,99 +895,30 @@ def run_batfish(
 ) -> BatfishStats:
     """Run Batfish over ``configs_dir``, write per-(node, vrf) FIBs to ``out_dir``.
 
-    ``session_factory`` and ``runner`` are test seams. Production code leaves
-    both ``None`` and a default pybatfish-backed session is used.
+    Thin one-shot wrapper around :class:`BatfishService`. Equivalent to
+    ``with BatfishService(...) as svc: return svc.run_one(...)``. Kept
+    verbatim as a backward-compatible entrypoint for the 3-way truth
+    path and one-off smoke tests. The ``warm`` field on the returned
+    :class:`BatfishStats` is always ``False`` here — the container
+    lifetime equals the call.
+
+    ``session_factory`` and ``runner`` are test seams. Production code
+    leaves both ``None`` and a default pybatfish-backed session is used.
 
     Returns a :class:`BatfishStats` with per-phase timing. Raises
     ``RuntimeError`` / ``TimeoutError`` on any underlying failure; the
     container is always stopped on exit.
     """
-    cfg = config or BatfishConfig()
-    runner = runner or DockerBatfishRunner()
-    if session_factory is None:
-        session_factory = _default_pybatfish_session_factory
-
-    started_iso = time.strftime("%Y-%m-%dT%H:%M:%S+0000", time.gmtime())
-    t0 = time.monotonic()
-
-    container_id = runner.start(cfg)
-    try:
-        runner.wait_ready(cfg, container_id)
-        session = session_factory(cfg)
-
-        t_init = time.monotonic()
-        with tempfile.TemporaryDirectory(prefix="bf-snap-") as stage_root_str:
-            stage_root = Path(stage_root_str)
-            stage_cfg_dir = stage_root / "configs"
-            stage_cfg_dir.mkdir(parents=True, exist_ok=True)
-            aws_stage: Path | None = None
-            for child in sorted(configs_dir.iterdir()):
-                if child.is_dir():
-                    # Mixed-vendor topologies (cEOS + FRR, Junos + FRR) drop a
-                    # per-vendor config file in each <device>/ subdir. Pick the
-                    # first one that matches our known set; Batfish auto-detects
-                    # vendor from content once it's named <device>.cfg.
-                    picked = None
-                    picked_kind: str | None = None
-                    for candidate, kind in (
-                        ("frr.conf", "frr"),
-                        ("startup-config", "arista"),
-                        ("running-config", None),
-                        ("config.boot", "juniper"),
-                        ("config", None),
-                    ):
-                        p = child / candidate
-                        if p.is_file():
-                            picked = p
-                            picked_kind = kind
-                            break
-                    if picked is not None:
-                        _stage_config(picked, stage_cfg_dir / f"{child.name}.cfg", picked_kind)
-                        continue
-                    # AWS describe-* JSON snapshot lives in configs/aws/. Batfish
-                    # expects aws_configs/ at the snapshot root.
-                    if child.name == "aws":
-                        aws_stage = stage_root / "aws_configs"
-                        aws_stage.mkdir(parents=True, exist_ok=True)
-                        for aws_file in sorted(child.glob("*.json")):
-                            shutil.copyfile(aws_file, aws_stage / aws_file.name)
-                elif child.is_file() and child.suffix in {".cfg", ".conf"}:
-                    # Top-level file (rare): sniff content for FRR markers.
-                    kind = "frr" if _looks_like_frr(child) else None
-                    _stage_config(child, stage_cfg_dir / child.name, kind)
-            session.init_snapshot(str(stage_root), name=f"bench-{topology}", overwrite=True)
-        init_s = time.monotonic() - t_init
-
-        t_routes = time.monotonic()
-        route_rows = session.get_routes()
-        routes_s = time.monotonic() - t_routes
-
-        t_bgp = time.monotonic()
-        bgp_rows = session.get_bgp_rib()
-        bgp_s = time.monotonic() - t_bgp
-
-        fibs = transform_batfish_rows(route_rows, bgp_rows=bgp_rows)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        for fib in fibs:
-            out_path = out_dir / f"{fib.node}__{fib.vrf}.json"
-            out_path.write_text(fib.model_dump_json(indent=2) + "\n")
-    finally:
-        try:
-            runner.stop(container_id)
-        except Exception as exc:  # noqa: BLE001 — stop failure is non-fatal; logged
-            log.warning("batfish: container stop failed: %s", exc)
-
-    stats = BatfishStats(
-        topology=topology,
-        started_iso=started_iso,
-        init_snapshot_s=init_s,
-        query_routes_s=routes_s,
-        query_bgp_s=bgp_s,
-        simulate_s=routes_s + bgp_s,
-        total_s=time.monotonic() - t0,
-    )
-    (out_dir / "batfish_stats.json").write_text(json.dumps(stats.as_dict(), indent=2) + "\n")
-    return stats
+    with BatfishService(
+        config=config,
+        runner=runner,
+        session_factory=session_factory,
+        # The one-shot path never samples memory — adds a background
+        # thread for no gain when the container is torn down instantly.
+        # Persistent-service callers opt in via BatfishService directly.
+        sample_memory=False,
+    ) as svc:
+        return svc.run_one(configs_dir, out_dir, topology=topology)
 
 
 def _default_pybatfish_session_factory(  # pragma: no cover - live-only

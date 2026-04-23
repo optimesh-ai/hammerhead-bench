@@ -20,6 +20,7 @@ from pathlib import Path
 
 import click
 
+from harness.aggregate import LoopbackPolicy
 from harness.diff.metrics import TopologyMetrics, aggregate_many
 from harness.pipeline import (
     BenchHooks,
@@ -32,7 +33,7 @@ from harness.pipeline import (
     run_topology_frr_only_truth,
     run_topology_sim_only,
 )
-from harness.tools.batfish import run_batfish
+from harness.tools.batfish import BatfishService, run_batfish
 from harness.tools.hammerhead import run_hammerhead
 from harness.topology import TopologySpec, load_spec
 
@@ -231,6 +232,41 @@ def _print_result(result) -> None:
     ),
 )
 @click.option(
+    "--persistent-batfish/--no-persistent-batfish",
+    "persistent_batfish",
+    default=True,
+    show_default=True,
+    help=(
+        "Keep the Batfish container alive across trials and topologies, "
+        "paying JVM cold-start once per bench run instead of once per "
+        "trial. Measures the steady-state 'warm JVM' solve latency a "
+        "production operator would observe, separate from the "
+        "per-trial 'cold container' wall-clock. Only honoured in "
+        "--sim-only mode. Per-topology stats report both the cold-first "
+        "and warm-rest simulate times so reviewers can see infrastructure "
+        "overhead apart from solve latency."
+    ),
+)
+@click.option(
+    "--loopback-policy",
+    "loopback_policy_str",
+    type=click.Choice(
+        ["strip", "materialize", "passthrough"], case_sensitive=False
+    ),
+    default="strip",
+    show_default=True,
+    help=(
+        "How to treat /32 loopback-host routes when comparing Batfish "
+        "and Hammerhead FIBs. 'strip' (default) drops connected/local "
+        "entries on lo* interfaces symmetrically — the standard "
+        "headline; closes the 23 pp IS-IS/OSPF presence gap caused by "
+        "Batfish materializing /32s that Hammerhead leaves implicit. "
+        "'materialize' synthesizes the missing /32s on whichever side "
+        "elides them. 'passthrough' does neither, surfacing the raw "
+        "un-reconciled set comparison (reviewer-diagnostic mode)."
+    ),
+)
+@click.option(
     "-v",
     "--verbose",
     is_flag=True,
@@ -248,6 +284,8 @@ def bench(
     sim_only: bool,
     frr_only_truth: bool,
     trials: int,
+    persistent_batfish: bool,
+    loopback_policy_str: str,
     verbose: bool,
 ) -> None:
     """Iterate every topology under ./topologies/ and collect metrics.
@@ -296,15 +334,33 @@ def bench(
         click.echo("bench: no topologies selected", err=True)
         sys.exit(1)
 
+    try:
+        loopback_policy = LoopbackPolicy(loopback_policy_str.lower())
+    except ValueError:
+        click.echo(
+            f"bench: unknown --loopback-policy {loopback_policy_str!r}; "
+            "must be one of strip|materialize|passthrough",
+            err=True,
+        )
+        sys.exit(2)
+
     hooks = BenchHooks(
         batfish=None if no_batfish else _default_batfish_hook,
         hammerhead=None if no_hammerhead else _default_hammerhead_hook,
+        loopback_policy=loopback_policy,
     )
 
     if sim_only:
-        _run_bench_sim_only(
-            selected, hooks=hooks, results_dir=results_dir, trials=trials
+        hooks, service = _maybe_attach_persistent_batfish(
+            hooks, enabled=persistent_batfish and not no_batfish
         )
+        try:
+            _run_bench_sim_only(
+                selected, hooks=hooks, results_dir=results_dir, trials=trials
+            )
+        finally:
+            if service is not None:
+                service.close()
         return
 
     if frr_only_truth:
@@ -669,6 +725,44 @@ def _select_topologies(
 
 
 # ----- simulator hooks ----------------------------------------------------
+
+
+def _maybe_attach_persistent_batfish(
+    hooks: BenchHooks, *, enabled: bool
+) -> tuple[BenchHooks, BatfishService | None]:
+    """Spin up a :class:`BatfishService` + rewire the hooks when asked.
+
+    Returns ``(hooks, service)``. Caller is responsible for closing the
+    service in a ``finally`` block. On start failure (docker missing,
+    image pull needed, JVM readiness timeout) this logs a warning,
+    leaves ``hooks`` unchanged, and returns ``service = None`` so the
+    bench falls back to the per-trial cold-container path rather than
+    aborting.
+    """
+    if not enabled:
+        return hooks, None
+    service = BatfishService()
+    try:
+        service.start()
+    except Exception as exc:  # noqa: BLE001 — cold-start failure is recoverable
+        click.echo(
+            f"bench: persistent Batfish start failed ({exc}); "
+            "falling back to per-trial cold containers.",
+            err=True,
+        )
+        return hooks, None
+    # Flip the hook: the plain callable is replaced with the persistent
+    # service, which the pipeline detects via duck-typing on ``run_one``.
+    # Leaves the 3-way truth path untouched because it never reads
+    # ``batfish_service``.
+    rewired = BenchHooks(
+        batfish=None,
+        batfish_service=service,
+        hammerhead=hooks.hammerhead,
+        filter_loopback_host=hooks.filter_loopback_host,
+        loopback_policy=hooks.loopback_policy,
+    )
+    return rewired, service
 
 
 def _default_batfish_hook(configs_dir: Path, out_dir: Path, topology: str) -> None:

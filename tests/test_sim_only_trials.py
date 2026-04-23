@@ -56,15 +56,27 @@ class _CountingHook:
 
     Also writes a ``<source>_stats.json`` sidecar so the pipeline's
     ``_read_stat`` path records a simulate-time reading per trial.
+
+    ``wall_sleep_s`` adds a real ``time.sleep`` inside the hook so the
+    pipeline's per-trial wall-clock measurement is dominated by the
+    deliberate sleep rather than pytest / OS jitter. Without it the
+    wall measurement is on the order of microseconds and the
+    ``wall_ratio > 1.0`` assertion becomes flaky under full-suite
+    load; the sleep is tiny (defaults ~5 ms) so the suite still runs
+    fast.
     """
 
     source: str  # "batfish" | "hammerhead"
     simulate_s: float = 0.42
     rib_total_s: float = 0.0
+    wall_sleep_s: float = 0.0
     calls: int = field(default=0)
 
     def __call__(self, configs_dir: Path, out_dir: Path, topology: str) -> None:  # noqa: ARG002
         self.calls += 1
+        if self.wall_sleep_s > 0:
+            import time  # noqa: PLC0415 — sleep only on the determinism path
+            time.sleep(self.wall_sleep_s)
         out_dir.mkdir(parents=True, exist_ok=True)
         for node in ("r1", "r2"):
             fib = _nodefib(node, self.source)
@@ -196,11 +208,17 @@ def test_agreement_exposes_fair_solve_plus_materialize_ratio(tmp_path: Path) -> 
     Pairs Batfish's fused query+materialize against Hammerhead's
     simulate+rib subprocesses — the only apples-to-apples comparison."""
     spec = load_spec(TOPO_DIR)
+    # ``wall_sleep_s`` makes the pipeline's wall measurement dominated
+    # by a deliberate per-hook sleep rather than OS jitter, so the
+    # ``wall_ratio > 1.0`` assertion below is deterministic under the
+    # full-suite load. BF sleeps 50 ms, HH sleeps 5 ms → ratio ~10.
     hooks = BenchHooks(
-        batfish=_CountingHook(source="batfish", simulate_s=0.90),
+        batfish=_CountingHook(source="batfish", simulate_s=0.90, wall_sleep_s=0.05),
         # HH: 0.02s in the simulator, 0.18s in the rib subprocess →
         # fair denominator 0.20, asymmetric denominator 0.02.
-        hammerhead=_CountingHook(source="hammerhead", simulate_s=0.02, rib_total_s=0.18),
+        hammerhead=_CountingHook(
+            source="hammerhead", simulate_s=0.02, rib_total_s=0.18, wall_sleep_s=0.005,
+        ),
     )
     result = run_topology_sim_only(
         spec,
@@ -441,6 +459,8 @@ def test_bench_cli_rejects_trials_without_sim_only(tmp_path: Path) -> None:
         catch_exceptions=False,
     )
     assert result.exit_code != 0
-    combined = (result.output or "") + (getattr(result, "stderr", "") or "")
+    # CliRunner default is mix_stderr=True, so stderr is folded into
+    # result.output. Reading .stderr on a mixed runner raises ValueError.
+    combined = result.output or ""
     assert "--trials" in combined
     assert "sim-only" in combined

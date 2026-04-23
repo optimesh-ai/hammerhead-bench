@@ -42,6 +42,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from harness.aggregate import LoopbackPolicy
 from harness.extract.fib import NextHop, NodeFib, Route, canonicalize_node_fib
 
 __all__ = [
@@ -127,6 +128,7 @@ def diff_fibs(
     workspace: DiffWorkspace,
     *,
     filter_loopback_host: bool = False,
+    loopback_policy: LoopbackPolicy | None = None,
 ) -> list[DiffRecord]:
     """Compare vendor / batfish / hammerhead FIBs cell-by-cell.
 
@@ -134,13 +136,16 @@ def diff_fibs(
     Each source is canonicalized up front via :func:`canonicalize_node_fib`
     so callers can pass raw adapter output.
 
-    ``filter_loopback_host`` is threaded to canonicalization so loopback
-    /32 host routes are stripped uniformly across all three sources, not
-    just one.
+    Loopback handling is symmetric across all three sources, driven by the
+    unified :class:`LoopbackPolicy` enum. Callers should prefer passing
+    ``loopback_policy`` directly; ``filter_loopback_host`` is the legacy
+    boolean bridge (maps to ``STRIP`` when True, ``PASSTHROUGH`` when False).
+    If both arguments are supplied the enum wins.
     """
-    vendor = _index_routes(workspace.vendor, filter_loopback_host=filter_loopback_host)
-    batfish = _index_routes(workspace.batfish, filter_loopback_host=filter_loopback_host)
-    hammerhead = _index_routes(workspace.hammerhead, filter_loopback_host=filter_loopback_host)
+    policy = loopback_policy or LoopbackPolicy.from_bool(filter_loopback_host)
+    vendor = _index_routes(workspace.vendor, loopback_policy=policy)
+    batfish = _index_routes(workspace.batfish, loopback_policy=policy)
+    hammerhead = _index_routes(workspace.hammerhead, loopback_policy=policy)
 
     keys: set[_RouteKey] = set(vendor) | set(batfish) | set(hammerhead)
     records: list[DiffRecord] = []
@@ -235,7 +240,7 @@ def _as_path_equal(a: list[int] | None, b: list[int] | None) -> bool:
 def _index_routes(
     fibs: Iterable[NodeFib],
     *,
-    filter_loopback_host: bool,
+    loopback_policy: LoopbackPolicy,
 ) -> dict[_RouteKey, Route]:
     """Build a ``{(node, vrf, prefix): Route}`` index.
 
@@ -245,7 +250,7 @@ def _index_routes(
     """
     out: dict[_RouteKey, Route] = {}
     for raw in fibs:
-        fib = canonicalize_node_fib(raw, filter_loopback_host=filter_loopback_host)
+        fib = canonicalize_node_fib(raw, loopback_policy=loopback_policy)
         for r in fib.routes:
             out[_RouteKey(node=fib.node, vrf=fib.vrf, prefix=r.prefix)] = r
     return out

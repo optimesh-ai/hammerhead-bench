@@ -485,7 +485,9 @@ def test_bench_cli_rejects_both_sim_only_and_frr_only_truth() -> None:
         catch_exceptions=False,
     )
     assert result.exit_code != 0
-    combined = (result.output or "") + (getattr(result, "stderr", "") or "")
+    # CliRunner default is mix_stderr=True, so stderr is folded into
+    # result.output. Reading .stderr on a mixed runner raises ValueError.
+    combined = result.output or ""
     assert "mutually exclusive" in combined
     assert "--sim-only" in combined
     assert "--frr-only-truth" in combined

@@ -28,6 +28,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from harness.aggregate import LoopbackPolicy
+
 Protocol = Literal["bgp", "ospf", "isis", "static", "connected", "local", "rip"]
 Source = Literal["vendor", "batfish", "hammerhead"]
 
@@ -119,16 +121,36 @@ def canonicalize_node_fib(
     fib: NodeFib,
     *,
     filter_loopback_host: bool = False,
+    loopback_policy: LoopbackPolicy | None = None,
 ) -> NodeFib:
     """Return a new ``NodeFib`` with VRF normalized, routes canonicalized, sorted.
 
-    ``filter_loopback_host`` is deliberately off by default. Turning it on is
-    an explicit operator choice at diff time and is recorded in the per-topology
-    result JSON so the filter decision is auditable.
+    Loopback handling is controlled by either:
+
+    * :class:`LoopbackPolicy` (preferred — symmetric, three-valued). When
+      ``loopback_policy`` is supplied it wins over ``filter_loopback_host``.
+    * Legacy ``filter_loopback_host: bool`` — back-compat bridge, maps to
+      ``STRIP`` when True and ``PASSTHROUGH`` when False via
+      :meth:`LoopbackPolicy.from_bool`.
+
+    Semantic of each policy at the canonicalizer surface:
+
+    * ``STRIP`` — drop every ``lo*``-interface /32 connected/local entry.
+      Applied symmetrically to vendor / Batfish / Hammerhead so the diff
+      engine reports only routes the *control plane* originated.
+    * ``MATERIALIZE`` — keep every route the adapter produced (diagnostic
+      view; synthesis of the matching sim-side /32 host entries is a
+      higher-level concern and not done here).
+    * ``PASSTHROUGH`` — identical to ``MATERIALIZE`` at this layer; left
+      distinct so upstream code can record which policy was requested.
+
+    The policy decision is passed through in the result and is the auditable
+    record in per-topology bench output.
     """
+    policy = loopback_policy or LoopbackPolicy.from_bool(filter_loopback_host)
     vrf = canonicalize_vrf(fib.vrf)
     routes = [canonicalize_route(r) for r in fib.routes]
-    if filter_loopback_host:
+    if policy.strip_loopback_host:
         routes = [r for r in routes if not _is_loopback_host(r)]
     # Deterministic ordering: prefix asc, then protocol asc.
     routes.sort(key=lambda r: (r.prefix, r.protocol))
