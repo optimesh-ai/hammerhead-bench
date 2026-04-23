@@ -41,10 +41,10 @@ differences do not inflate disagreement.
 | isis-l1l2-4node | 4 | 6 / 26 | 23% | 100.0% | 21.88±0.66s | 28.0±0.6ms | 781.0× | 168.4× |
 | mixed-vendor-frr-ceos-4node | 4 | 12 / 8 | 67% | 100.0% | 27.93±0.74s | 33.1±10.9ms | 843.7× | 187.4× |
 | mpls-l3vpn-4node | 4 | 26 / 8 | 21% | 100.0% | 23.74±0.41s | 27.1±0.1ms | 876.2× | 253.2× |
+| ospf-broadcast-4node | 4 | 16 / 4 | 25% | 100.0% | 22.72±0.65s | 26.4±0.9ms | 859.2× | 226.8× |
 | multi-as-edge-5node | 5 | 27 / 27 | 100% | 100.0% | 24.45±0.74s | 27.7±0.8ms | 883.1× | 229.3× |
-| ospf-broadcast-4node | 5 | 16 / 4 | 25% | 100.0% | 22.81±0.66s | 26.4±0.7ms | 862.6× | 214.6× |
+| route-reflector-6node | 6 | 36 / 36 | 100% | 100.0% | 25.57±1.38s | 29.3±0.5ms | 872.8× | 240.1× |
 | spine-leaf-6node | 6 | 36 / 36 | 100% | 100.0% | 25.10±0.33s | 29.5±0.8ms | 850.3× | 235.5× |
-| route-reflector-6node | 7 | 36 / 36 | 100% | 100.0% | 25.42±0.21s | 28.2±0.4ms | 901.9× | 250.9× |
 | spine-leaf-20node | 20 | 432 / 432 | 100% | 100.0% | 35.65±0.67s | 51.0±6.3ms | 699.4× | 362.4× |
 | spine-leaf-50node | 50 | 2622 / 2622 | 100% | 100.0% | 51.51±0.92s | 140.3±3.3ms | 367.2× | 299.7× |
 | hub-spoke-wan-51node | 51 | 5251 / 5251 | 100% | 100.0% | 45.14±0.59s | 117.1±13.3ms | 385.5× | 259.2× |
@@ -57,17 +57,17 @@ defined in § 2.
 The `Presence` column is the per-topology Jaccard
 `|B ∩ H| / |B ∪ H|` on `(node, vrf, prefix)` keys; see § 2 for
 the formal definition. Topologies below 100% presence (e.g.
-`isis-l1l2-4node` at 23.1%) reflect Batfish materializing /32
+`isis-l1l2-4node` at 23%) reflect Batfish materializing /32
 loopback host routes that Hammerhead elides — a documented
 modeling difference rather than a simulator disagreement
 (§ 3 "Route-count asymmetry").
 
 **Aggregate over the corpus.** The headline aggregate is the
 unweighted mean of per-topology `fair_ratio` across all 16 topologies
-(definition in § 2): **mean = 232×** (median 218×, range **168×** at
+(definition in § 2): **mean = 232×** (median 223×, range **168×** at
 4-node IS-IS to **362×** at 20-node spine-leaf, n=16). The
 corresponding unweighted-mean `wall_ratio` (includes Batfish JVM +
-snapshot upload) is **696×**; post-migration (see § 3, "Harness
+snapshot upload) is **694×**; post-migration (see § 3, "Harness
 migration history") the `asym_ratio` lower bound collapses onto
 `fair_ratio` because the Hammerhead-side RIB materialization step is
 now inside the single `simulate --emit-rib all` call the numerator
@@ -86,6 +86,16 @@ all 16 topologies**. Absolute cell counts, per-trial wall-clocks
 (when `--trials N` was used), and raw per-topology times are in
 `results/<topology>.json`; the rolled-up aggregate is in
 `results/bench_summary.json`.
+
+**One note on the 362× `fair_ratio` peak at `spine-leaf-20node`.**
+20 nodes is where Batfish's solver crosses into a regime with
+enough routes (432) that per-cell work starts to dominate its
+fixed ~22 s JVM-warmup band, while Hammerhead is still inside its
+own ~50 ms fixed-overhead floor (parse + build + single SPF). At
+that crossover the numerator climbs faster than the denominator
+and the ratio spikes. Beyond 20 nodes both tools scale roughly
+linearly in route count and the `fair_ratio` settles into the
+200-300× band — visible in the 50-/51-/100-node rows above.
 
 ### 1.1 Ground-truth agreement (FRR subset)
 
@@ -418,7 +428,7 @@ Per-topology pipeline, sequential, driven by
 6. **Batfish** — `batfish/allinone` container (`-Xmx4g`),
    pybatfish against the same config directory, FIB extracted
    to the shared shape.
-7. **Hammerhead** — `$HAMMERHEAD_CLI simulate --format json`
+7. **Hammerhead** — `$HAMMERHEAD_CLI simulate --emit-rib all --format json`
    on the same directory, transformed to the shared shape.
 8. **Diff** — per (node, vrf, prefix) presence, next-hop,
    protocol, and BGP-attribute rows (`harness.diff.engine`),
@@ -495,7 +505,7 @@ laptop variance is not in the scope of this artifact.
 
 ```bash
 uv sync --all-extras --dev
-uv run pytest                     # 194 passed, 1 skipped
+uv run pytest                     # 219 passed, 1 skipped
 uv run ruff check .
 ```
 
@@ -534,17 +544,26 @@ hammerhead-bench report --results-dir results/             # regenerate HTML + M
 
 Beyond the threats in § 3:
 
-- **The corpus is small-to-medium.** 100 nodes is the largest
-  topology here. Hammerhead itself has been exercised at
-  ≥ 5,120 nodes, and Batfish has been reported on networks of
-  comparable size by its maintainers, but we have not measured
-  either on 1,000+ -node configs *in this harness*. The **156×
-  wall / 200× fair** ratio at 100 nodes is the most informative
-  single datum for extrapolation; it is the smallest `wall_ratio`
-  we report but sits near the corpus median on `fair_ratio`.
-  Scale-regime readers should weight the 20-/50-/100-node rows
-  more heavily than the 2-/3-/4-node rows when extrapolating to
-  production-sized fabrics.
+- **The corpus tops out at 100 nodes for head-to-head numbers.**
+  `spine-leaf-100node` is the largest topology the bench harness
+  measures end-to-end (Batfish + Hammerhead, shared config
+  directory, shared diff engine). The repo also ships a standalone
+  5,120-switch fixture at `topologies/fat-tree-k64/` with
+  Hammerhead-only timings — 9.3 s median total, 11.6 M FIB
+  entries, ~6.6 GB peak RSS (`hammerhead profile`, 2026-04-22,
+  see that fixture's README) — but it is **not** run through this
+  bench's sim-only loop because marshalling 11.6 M routes through
+  subprocess stdout + `json.loads` costs several GB on the Python
+  side, on top of Hammerhead's own peak RSS; laptops OOM well
+  before Batfish could finish. Batfish has been reported on
+  networks of comparable size by its maintainers, but we have not
+  measured it on 1,000+ -node configs *in this harness*. The
+  **156× wall / 200× fair** ratio at 100 nodes is the most
+  informative single datum for extrapolation; it is the smallest
+  `wall_ratio` we report but sits near the corpus median on
+  `fair_ratio`. Scale-regime readers should weight the
+  20-/50-/100-node rows more heavily than the 2-/3-/4-node rows
+  when extrapolating to production-sized fabrics.
 - **We do not measure peak RSS in sim-only mode.** The header
   of § 1 is wall-clock-only. `--with-truth` mode does
   measure RSS; sim-only does not, because the Batfish-in-

@@ -711,7 +711,13 @@ def run_topology_sim_only(
             hammerhead_sims=hammer_sims,
             batfish_inits=batfish_inits,
             hammerhead_ribs=hammer_ribs,
-            nodes=len(spec.nodes),
+            # Count only config-emitting nodes. Containerlab bridge adapters
+            # (empty config_template_names) are L2 plumbing and don't
+            # participate in routing; including them overcounts the
+            # control-plane topology size on ospf-broadcast-4node /
+            # route-reflector-6node, where a `hub` bridge sits alongside the
+            # routers.
+            nodes=sum(1 for n in spec.nodes if n.adapter.config_template_names),
         )
         result.agreement = agreement
         result.diff_path = diff_dir
