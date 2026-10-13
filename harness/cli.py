@@ -718,6 +718,10 @@ def _select_topologies(
         if name in ACL_SEMANTICS_TOPOLOGIES and not with_acl_semantics:
             continue
         spec = load_spec(path)
+        # Scale fixtures (fat-tree-k64) render their own configs and carry no
+        # node list, so --max-nodes can't filter them. Run them only by name.
+        if spec.external_renderer is not None and name not in only:
+            continue
         if max_nodes is not None and len(spec.nodes) > max_nodes:
             continue
         specs.append(spec)

@@ -20,8 +20,9 @@ the pod structure.
 
 ## Sim-only only
 
-This fixture uses the `TopologySpec.external_renderer` escape hatch.
-`--with-truth` is not supported — no clab YAML is rendered, and
+This fixture uses the `TopologySpec.external_renderer` escape hatch,
+so it runs only when named with `--only fat-tree-k64`; `make bench`
+and `make bench-fast` leave it out. `--with-truth` is not supported — no clab YAML is rendered, and
 standing up 5,120 containerised switches isn't viable on developer
 hardware.
 
