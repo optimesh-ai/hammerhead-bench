@@ -16,10 +16,11 @@ abstract: >-
   spanning 2-100 nodes and seven control-plane axes (BGP, OSPFv2, IS-IS,
   multi-vendor, ACL-dominant parse, Clos and hub-and-spoke scale), a diff
   engine computing formal next-hop / protocol / BGP-attribute agreement on
-  set-intersection (node, vrf, prefix) cells, and pinned container-image
-  digests for reproducibility. The reference measurement compares Hammerhead
-  against Batfish on a single laptop in sim-only mode; a separate with-truth
-  mode cross-validates against live FRR and Arista cEOS-lab ground truth.
+  set-intersection (node, vrf, prefix) cells, and a Batfish image pinned by
+  digest. The harness compares Hammerhead against Batfish in sim-only mode; a
+  with-truth mode cross-validates against live FRR and Arista cEOS-lab. The
+  results quoted in the README are Hammerhead's scheduled FRR ground-truth,
+  Batfish conformance and parity runs, each with its run ID and digest.
 keywords:
   - network-verification
   - control-plane-simulation
@@ -30,5 +31,5 @@ keywords:
   - benchmark
   - reproducibility
 license: Apache-2.0
-version: "0.2.0"
-date-released: "2026-04-21"
+version: "0.3.0"
+date-released: "2026-10-13"

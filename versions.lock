@@ -9,26 +9,28 @@
 #   docker manifest inspect frrouting/frr:v8.4.1
 #
 # Note: the `frrouting/frr` Docker Hub repo was frozen at v8.4.1 in Dec 2022
-# — upstream FRR moved to source builds and no longer publishes there. v8.4.1
-# is also the version Hammerhead's ground-truth harness validated against,
-# which is convenient (same FRR means the two harnesses measure the same
-# semantics). For newer FRR, users build locally from
-# https://github.com/FRRouting/frr and override FRR_IMAGE.
+# — upstream FRR moved to source builds and no longer publishes there.
+# Hammerhead's own ground-truth job moved to
+# quay.io/frrouting/frr:10.7.1 (pinned by digest) on 2026-09-23; this
+# harness's --with-truth path has not been re-validated on that image, so
+# the v8.4.1 pin (also the FRR adapter's default image) stays until it is.
 FRR_IMAGE=frrouting/frr:v8.4.1
 
 # -- Batfish --
 # Pinned by digest because Docker Hub allows tags to be re-pushed and the
-# batfish/allinone:latest tag is moved weekly. A benchmark that claims "Batfish
-# v2024.05.01" is meaningless if the underlying image drifted.
+# batfish/allinone:latest tag moves. This is the same oracle digest Hammerhead's
+# parity and weekly conformance jobs use, so a run of this harness compares
+# against the same Batfish build as the numbers in README § 1.
 #
-# Populate this on a fresh machine with:
+# To move the pin, pull the new image and paste its digest:
 #
 #   docker pull batfish/allinone:latest
 #   docker image inspect batfish/allinone:latest \
 #       --format '{{index .RepoDigests 0}}'
 #
-# ... then paste the sha256 here. preflight.py warns if the placeholder is still set.
-BATFISH_IMAGE=batfish/allinone@sha256:PIN_AFTER_FIRST_PULL
+# Record the move in results/CHANGELOG.md: results taken against different
+# digests are not comparable.
+BATFISH_IMAGE=batfish/allinone@sha256:09817554db90e2f2674b72562c2d659427094187de0a3dfc23534ab58bf26207
 
 # -- Arista cEOS-lab --
 # cEOS images are not on Docker Hub (Arista requires a free EOS Central account).

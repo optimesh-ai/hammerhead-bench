@@ -28,11 +28,8 @@ subprocesses per topology). Each of those extra invocations rebuilt the
 full Pipeline from scratch (re-parse, re-simulate every protocol) so
 the per-device rib phase dominated Hammerhead's measured wall-clock on
 larger topologies. Switching to a single bulk emit collapses that N+1
-subprocess tax into one invocation that runs ``Pipeline::build``
-exactly once (enforced by an integration test in the Hammerhead repo:
-``crates/hammerhead-cli/tests/pipeline_build_count.rs``), which is why
-post-migration numbers are dramatically faster than the pre-migration
-corpus.
+subprocess tax into one invocation that parses and simulates once, so
+pre- and post-migration timings are not comparable.
 
 Test seams: :class:`HammerheadRunner` is a Protocol injected via the
 ``runner`` keyword argument. Production default is
@@ -98,8 +95,8 @@ class HammerheadStats:
 
     * ``simulate_s`` — wall-clock of the single
       ``hammerhead simulate --emit-rib all`` subprocess. Covers solver
-      work **and** per-device RIB materialization in one shot (the
-      bulk emit amortises ``Pipeline::build`` across every device).
+      work **and** per-device RIB materialization in one shot (one
+      parse and one simulation serve every device).
     * ``rib_total_s`` — legacy field, **always 0.0** in the bulk path.
       Retained for results-JSON schema backward compatibility so
       downstream consumers (report layer, Batfish comparison glue) do

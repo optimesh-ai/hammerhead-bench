@@ -11,9 +11,12 @@ import pytest
 from harness.extract.fib import NodeFib
 from harness.tools.batfish import (
     BATFISH_MEMORY_MB,
+    UNPINNED_BATFISH_IMAGE,
+    VERSIONS_LOCK,
     BatfishConfig,
     BatfishRunner,
     BatfishSession,
+    default_batfish_image,
     run_batfish,
     transform_batfish_rows,
 )
@@ -385,3 +388,21 @@ def test_run_batfish_writes_bgp_attrs_from_rib(tmp_path: Path) -> None:
     assert r.as_path == [65001, 65002]
     assert r.local_pref == 100
     assert r.med == 0
+
+
+def test_default_batfish_image_reads_versions_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("BATFISH_IMAGE", raising=False)
+    # The checked-in lockfile pins a digest, and BatfishConfig picks it up.
+    pinned = default_batfish_image(VERSIONS_LOCK)
+    assert pinned.startswith("batfish/allinone@sha256:")
+    assert BatfishConfig().image == pinned
+
+    lock = tmp_path / "versions.lock"
+    lock.write_text("BATFISH_IMAGE=batfish/allinone@sha256:PIN_AFTER_FIRST_PULL\n")
+    assert default_batfish_image(lock) == UNPINNED_BATFISH_IMAGE
+    assert default_batfish_image(tmp_path / "missing.lock") == UNPINNED_BATFISH_IMAGE
+
+    monkeypatch.setenv("BATFISH_IMAGE", "batfish/allinone@sha256:abc")
+    assert default_batfish_image(lock) == "batfish/allinone@sha256:abc"

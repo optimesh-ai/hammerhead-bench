@@ -10,6 +10,8 @@ Verifies the host is ready to run benchmarks:
 - Container images pinned in versions.lock (FRR present-or-pullable,
   Batfish digest set to a real sha256 and not the placeholder)
 - On Linux, the harness can set RLIMIT_AS
+- A Hammerhead licence is present (v0.2.0+ release builds refuse to run
+  without one). Presence only: the token is never read or printed.
 
 Exit code 0 on pass-or-warn, 1 on any fail, 2 on dependency import failure.
 """
@@ -142,12 +144,16 @@ def _parse_versions_lock(root: Path) -> dict[str, str]:
 
 
 def _image_present_locally(image: str) -> bool:
-    proc = subprocess.run(
-        ["docker", "image", "inspect", image],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            ["docker", "image", "inspect", image],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        # No docker CLI: check_docker already reports that as a failure.
+        return False
     return proc.returncode == 0
 
 
@@ -162,6 +168,8 @@ def _image_pullable(image: str) -> tuple[bool, str]:
         )
     except subprocess.TimeoutExpired:
         return False, "manifest inspect timed out"
+    except FileNotFoundError:
+        return False, "docker CLI not found"
     if proc.returncode == 0:
         return True, "registry reachable"
     return False, (proc.stderr.strip() or proc.stdout.strip()).splitlines()[0]
@@ -253,6 +261,37 @@ def check_hammerhead_cli() -> CheckResult:
     return CheckResult("hammerhead-cli", "pass", str(resolved))
 
 
+def check_hammerhead_license() -> CheckResult:
+    """Warn when no licence is where Hammerhead looks for one.
+
+    Hammerhead v0.2.0+ release builds read ``$HAMMERHEAD_LICENSE`` (the
+    token), then the file named by ``$HAMMERHEAD_LICENSE_FILE``, then
+    ``~/.config/hammerhead/license``. A warning, not a failure: older
+    builds and the fake CLI need no licence. Only presence is checked;
+    the token itself is never opened, validated or echoed.
+    """
+    if os.environ.get("HAMMERHEAD_LICENSE", "").strip():
+        return CheckResult("hammerhead-license", "pass", "HAMMERHEAD_LICENSE is set")
+    named = os.environ.get("HAMMERHEAD_LICENSE_FILE", "").strip()
+    if named:
+        f = Path(named).expanduser()
+        if f.is_file():
+            return CheckResult("hammerhead-license", "pass", f"HAMMERHEAD_LICENSE_FILE={f}")
+        return CheckResult(
+            "hammerhead-license", "warn", f"HAMMERHEAD_LICENSE_FILE={f} is not a file"
+        )
+    default = Path.home() / ".config" / "hammerhead" / "license"
+    if default.is_file():
+        return CheckResult("hammerhead-license", "pass", str(default))
+    return CheckResult(
+        "hammerhead-license",
+        "warn",
+        "no licence found; Hammerhead v0.2.0+ refuses to run without one. "
+        "Request access at https://optimesh.ai/#trial, then "
+        "`hammerhead license install <token>` or export HAMMERHEAD_LICENSE",
+    )
+
+
 def main() -> int:
     repo_root = Path(__file__).resolve().parent.parent
     versions = _parse_versions_lock(repo_root)
@@ -267,6 +306,7 @@ def main() -> int:
         check_ceos_image(versions),
         check_rlimit(),
         check_hammerhead_cli(),
+        check_hammerhead_license(),
     ]
 
     table = Table(title="hammerhead-bench preflight", show_header=True, header_style="bold")

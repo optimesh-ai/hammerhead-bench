@@ -206,9 +206,8 @@ def test_non_bgp_route_has_no_bgp_attrs() -> None:
 
 
 def test_discard_next_hop_ip_normalizes_to_none() -> None:
-    # Rust emits 0.0.0.0 as the discard marker (`format_communities`
-    # comment in simulate.rs, analogous behavior in rib.rs). We store
-    # None on the Python side so diffs ignore the artificial address.
+    # Hammerhead emits 0.0.0.0 as the discard marker. We store None
+    # on the Python side so diffs ignore the artificial address.
     fib = transform_rib_view(
         _view(
             [

@@ -2,7 +2,7 @@
 
 An open benchmark corpus and measurement harness for empirical
 head-to-head comparison of network control-plane simulators.
-We compare **[Hammerhead](https://github.com/optimesh-ai/hammerhead)**
+We compare **[Hammerhead](https://optimesh.ai)**
 against **[Batfish](https://batfish.org)** (and, optionally,
 against live vendor ground truth from FRR and Arista cEOS-lab)
 across 16 topologies spanning 2–100 nodes and seven control-plane
@@ -14,97 +14,56 @@ Jinja2 topology templates, pinned container-image digests, and a
 `make bench`-level reproducer.
 
 **Status of this artifact.** Sim-only mode (tool vs. tool on the
-same rendered config directory) is runnable on a single laptop in
-~10 min. The `--with-truth` mode (live containerlab deployment +
-per-device FIB extraction) is also implemented but requires the
-cEOS-lab image, is slower (~1 h), and is not the baseline of the
-numbers below.
+same rendered config directory) runs on a single Docker-capable
+host. The `--with-truth` mode (live containerlab deployment +
+per-device FIB extraction) is also implemented but requires Linux
+and, for two topologies, the cEOS-lab image. This repository
+currently publishes no numbers produced by this harness; § 1 says
+which numbers we do stand behind and where they come from.
 
-## 1. Results (sim-only)
+## 1. Results
 
-We report measurements from a single run on an Apple M-series
-laptop (10 performance cores, 32 GB RAM, macOS 15), `hammerhead-bench
-bench --sim-only`. Batfish runs in `batfish/allinone:latest` with
-`_JAVA_OPTIONS=-Xmx4g`; Hammerhead runs as a release binary.
-Both tools ingest the exact same rendered config directory per
-topology. We canonicalize next-hop descriptors before comparison
-(`AUTO/NONE`, `dynamic`, `null_interface` → `None`) so syntactic
-differences do not inflate disagreement.
+**The April 2026 table is withdrawn.** The speed ratios and 100%
+agreement table shown here from 2026-04-21 came from one laptop run
+against an unpinned `batfish/allinone:latest` and could not be
+reproduced; they were withdrawn on 2026-08-12.
 
-| Topology | Nodes | Routes (bf / hh) | Presence | NH agree | BF wall | HH wall | Wall ratio | Fair ratio |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| bgp-ebgp-2node | 2 | 4 / 4 | 100% | 100.0% | 21.51±0.75s | 27.0±0.8ms | 795.8× | 198.5× |
-| bgp-ibgp-2node | 2 | 4 / 4 | 100% | 100.0% | 22.07±0.94s | 27.2±0.8ms | 812.6× | 206.1× |
-| acl-heavy-parse | 3 | 15 / 6 | 40% | 100.0% | 22.42±0.64s | 83.2±1.8ms | 269.5× | 217.0× |
-| ospf-p2p-3node | 3 | 15 / 6 | 40% | 100.0% | 21.47±0.87s | 25.5±1.8ms | 841.3× | 219.4× |
-| route-map-pathological | 3 | 15 / 15 | 100% | 100.0% | 22.75±0.51s | 28.1±0.9ms | 810.4× | 215.2× |
-| isis-l1l2-4node | 4 | 6 / 26 | 23% | 100.0% | 21.88±0.66s | 28.0±0.6ms | 781.0× | 168.4× |
-| mixed-vendor-frr-ceos-4node | 4 | 12 / 8 | 67% | 100.0% | 27.93±0.74s | 33.1±10.9ms | 843.7× | 187.4× |
-| mpls-l3vpn-4node | 4 | 26 / 8 | 21% | 100.0% | 23.74±0.41s | 27.1±0.1ms | 876.2× | 253.2× |
-| ospf-broadcast-4node | 4 | 16 / 4 | 25% | 100.0% | 22.72±0.65s | 26.4±0.9ms | 859.2× | 226.8× |
-| multi-as-edge-5node | 5 | 27 / 27 | 100% | 100.0% | 24.45±0.74s | 27.7±0.8ms | 883.1× | 229.3× |
-| route-reflector-6node | 6 | 36 / 36 | 100% | 100.0% | 25.57±1.38s | 29.3±0.5ms | 872.8× | 240.1× |
-| spine-leaf-6node | 6 | 36 / 36 | 100% | 100.0% | 25.10±0.33s | 29.5±0.8ms | 850.3× | 235.5× |
-| spine-leaf-20node | 20 | 432 / 432 | 100% | 100.0% | 35.65±0.67s | 51.0±6.3ms | 699.4× | 362.4× |
-| spine-leaf-50node | 50 | 2622 / 2622 | 100% | 100.0% | 51.51±0.92s | 140.3±3.3ms | 367.2× | 299.7× |
-| hub-spoke-wan-51node | 51 | 5251 / 5251 | 100% | 100.0% | 45.14±0.59s | 117.1±13.3ms | 385.5× | 259.2× |
-| spine-leaf-100node | 100 | 10355 / 10355 | 100% | 100.0% | 90.26±1.00s | 577.9±17.7ms | 156.2× | 199.8× |
+The numbers below are the ones we currently quote. They come from
+Hammerhead's own CI, not from this harness, and each one is re-run
+on a schedule against a container image pinned by digest.
 
-Wall ratio includes JVM startup and snapshot upload on the Batfish
-side; fair ratio is the apples-to-apples solve+materialize comparison
-defined in § 2.
+| What was measured | Against | Result | Hammerhead | Run, date | Re-run |
+|---|---|---|---|---|---|
+| Routes on a 10-router FRR lab (OSPF areas 0/1/2, IS-IS L2, iBGP with route reflectors, eBGP, redistribution), captured only after every adjacency is up and every RIB has been unchanged for 60 s | Live FRR routers: `quay.io/frrouting/frr:10.7.1@sha256:e995beaa50fdc9edb35eadcfefa29b7f062cc06f2b812613789b68fa541554d2` | All 136 prefixes match; **135 of 136** next hops (99.3%). 0 FRR-only, 0 Hammerhead-only entries | v0.2.0 (`8e884af2`) | 38253261665, 2026-10-12 | Weekly (Mondays); compared against the committed 2026-09-23 baseline, which has the same counts |
+| Routing tables over 351 datasets (2,040 devices) from Hammerhead's test corpora, demos and generated topologies; IPv4, default VRF, RIB only | Batfish `batfish/allinone@sha256:09817554db90e2f2674b72562c2d659427094187de0a3dfc23534ab58bf26207`, pybatfish 2025.7.7.2423 | **94.41%** of prefixes (267,262 of 283,084); egress interface agrees on **99.80%** of the prefixes both have. Over the 309 datasets Batfish parsed fully: 98.50% / 99.90% | `094c2391` | 38134221802, 2026-10-11 | Weekly (Sundays). The committed baseline (run 35944180044) has the same percentages, over 267,262 of 283,098 |
+| Parity gate: four corpora (triangle, NX-OS, EOS, Junos), 12 devices, scored only over the devices the oracle answered for | Same Batfish digest | **37 of 38** prefixes; **37 of 37** egress interfaces | v0.2.0 (`8e884af2`) | 38218573680, 2026-10-12 | Every push to Hammerhead's main and weekly. The committed full report adds ASA and FRR corpora (14 devices): 44 of 47 prefixes, 44 of 44 egress interfaces (`ca8ef169`, 2026-08-28) |
 
-The `Presence` column is the per-topology Jaccard
-`|B ∩ H| / |B ∪ H|` on `(node, vrf, prefix)` keys; see § 2 for
-the formal definition. Topologies below 100% presence (e.g.
-`isis-l1l2-4node` at 23%) reflect Batfish materializing /32
-loopback host routes that Hammerhead elides — a documented
-modeling difference rather than a simulator disagreement
-(§ 3 "Route-count asymmetry").
+**What these do not say.**
 
-**Aggregate over the corpus.** `results/bench_summary.json`
-reports three reductions of the per-topology `fair_ratio`
-side-by-side (§ 2.4): `arithmetic_mean` (legacy baseline),
-`geometric_mean` (multiplicative-scale central tendency — the one
-reviewers should cite as "typical ratio"), and
-`workload_weighted_mean` (route-count-weighted — pulls the headline
-toward production-scale topologies and damps small-rig noise). On
-the 16-topology corpus the arithmetic `fair_ratio` mean is **232×**
-(median 223×, range **168×** at 4-node IS-IS to **362×** at 20-node
-spine-leaf, n=16); the `geometric_mean` and `workload_weighted_mean`
-columns in the summary JSON are what we cite when we need one
-number. The corresponding arithmetic `wall_ratio` (includes Batfish
-JVM + snapshot upload) is **694×**; post-migration (see § 3,
-"Harness migration history") the `asym_ratio` lower bound collapses
-onto `fair_ratio` because the Hammerhead-side RIB materialization
-step is now inside the single `simulate --emit-rib all` call the
-numerator measures. We do not recommend citing any single aggregate
-as a headline speedup number without qualification; § 3 explains
-the regime structure — ratios still contract with topology size on
-the `wall_ratio` axis because Batfish's fixed ~22 s init cost
-amortizes over larger solves, but the `fair_ratio` curve is now
-much flatter than it was under the per-device-rib harness.
+- The FRR row is one lab topology on one routing stack, not
+  production hardware and not the other vendors Hammerhead parses.
+  The one next-hop miss is R3's `10.2.0.0/16` area-range summary:
+  both sides discard it, but they label the discard differently and
+  the lab's comparison does not pair the two labels.
+- The Batfish rows compare two models, not a model with routers.
+  If both read a config the same wrong way, they agree on the wrong
+  answer. Of the 16,359 disagreements in the conformance baseline,
+  12,051 come from four datasets whose `frr.conf` Batfish reads with
+  its IOS grammar.
+- Agreement is only counted where Batfish produced an answer. A
+  Batfish digest change makes the numbers incomparable, so the
+  digest is bumped deliberately and the baseline re-recorded.
 
-**Agreement.** On the intersection of (node, vrf, prefix) cells
-installed by both tools (the `|B ∩ H|` column in the per-topology
-report), all three equality relations — next-hop-set, protocol,
-and BGP-attribute (AS_PATH, LOCAL_PREF, MED) — are **100% across
-all 16 topologies**. Absolute cell counts, per-trial wall-clocks
-(when `--trials N` was used), and raw per-topology times are in
-`results/<topology>.json`; the rolled-up aggregate is in
-`results/bench_summary.json`.
+**Speed.** We publish no speed comparison with Batfish. The harness
+still records wall-clock times and computes the ratios defined in
+§ 2.3 for anyone who runs it; a figure from your own run describes
+your host and your pins, and § 3 lists what it does not control for.
 
-**One note on the 362× `fair_ratio` peak at `spine-leaf-20node`.**
-20 nodes is where Batfish's solver crosses into a regime with
-enough routes (432) that per-cell work starts to dominate its
-fixed ~22 s JVM-warmup band, while Hammerhead is still inside its
-own ~50 ms fixed-overhead floor (parse + build + single SPF). At
-that crossover the numerator climbs faster than the denominator
-and the ratio spikes. Beyond 20 nodes both tools scale roughly
-linearly in route count and the `fair_ratio` settles into the
-200-300× band — visible in the 50-/51-/100-node rows above.
+**Evidence.** Hammerhead's repository and CI are private. The run IDs
+above identify the evidence records (result JSON, captured RIBs,
+digests), which we share on request: <https://optimesh.ai/#trial>.
 
-### 1.1 Ground-truth agreement (FRR subset)
+### 1.1 Ground truth through this harness (FRR subset)
 
 `hammerhead-bench bench --frr-only-truth` extends the sim-only
 diff into a 3-way comparison — *vendor truth T* (extracted from a
@@ -112,39 +71,24 @@ live containerlab deployment of the rendered configs), *Batfish
 B*, and *Hammerhead H* — on the subset of topologies that are
 runnable against FRR / Cumulus only. A topology qualifies when
 every node's adapter kind is `frr` or `cumulus_vx`, the node
-count is ≤ 20 (the containerlab laptop ceiling we carve in at
-`harness/topology.py:FRR_ONLY_TRUTH_MAX_NODES`), and the spec
-does not use the `external_renderer` escape hatch. Topologies
-outside that subset (mixed-vendor snapshots, fat-tree k=64,
-spine-leaf-100node, …) fall back to sim-only in the same run
-and appear with `truth_source: null` in
-`results/<topology>.json`. The 3-way triad is
-`batfish_vs_truth`, `hammerhead_vs_truth`, `batfish_vs_hammerhead`;
-each triad carries the same four metrics as the sim-only
-agreement (`presence`, `next_hop`, `protocol`, `bgp_attr`) on
-the `|X ∩ Y| / |X ∪ Y|` and `|X ∩ Y|` denominators defined in
-§ 2.
+count is ≤ 20 (`harness/topology.py:FRR_ONLY_TRUTH_MAX_NODES`),
+and the spec does not use the `external_renderer` escape hatch.
+Topologies outside that subset fall back to sim-only in the same
+run and appear with `truth_source: null` in
+`results/<topology>.json`. The 3-way triad is `batfish_vs_truth`,
+`hammerhead_vs_truth`, `batfish_vs_hammerhead`; each carries the
+same four metrics as the sim-only agreement (`presence`,
+`next_hop`, `protocol`, `bgp_attr`) as defined in § 2.
 
-**Scope note.** The table below is a placeholder: this
-macOS laptop cannot run containerlab (Docker + veth requires
-Linux), so the 3-way path returns `containerlab_unsupported`
-for every row. We publish ground-truth numbers only from a
-Linux CI run — not by hand-assembled claims. When the Linux
-run lands, this subsection will carry a populated 8-column
-table (`Topology`, `T routes`, `B routes`, `H routes`,
-`B vs T presence`, `H vs T presence`, `B vs T NH`,
-`H vs T NH`) alongside the existing § 1 two-way table.
-
-| Topology | T routes | B routes | H routes | B vs T presence | H vs T presence | B vs T NH | H vs T NH |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| *TBD — populated on Linux CI* | — | — | — | — | — | — | — |
+No run of this mode has been published. It needs Linux
+(containerlab uses Docker + veth), and its FRR pin in
+`versions.lock` is still `frrouting/frr:v8.4.1`, not the 10.7.1
+image the table above uses. We will publish a table here only from
+a CI run, never from hand-assembled numbers.
 
 The `--frr-only-truth` mode is mutually exclusive with
 `--sim-only` (the CLI exits non-zero if both are passed). All
-other existing flags (`--only`, `--trials`, `--out`, …) work as
-before. Topologies that fall back to sim-only keep their
-existing JSON shape byte-for-byte, so downstream consumers of
-the sim-only run are not affected.
+other flags (`--only`, `--trials`, `--out`, …) work as before.
 
 ## 2. Agreement metric (formal definition)
 
@@ -246,9 +190,12 @@ reconciliation vs. raw overlap.
 
 ### 2.3 Fair speedup ratio
 
+The harness computes the ratios below for anyone who runs it. We
+do not publish them (§ 1).
+
 **Infrastructure overhead vs. solver latency.** Batfish sits
-behind a JVM + Jetty stack that takes ~18–22 s to reach REST
-readiness on our host. The harness can run Batfish two ways:
+behind a JVM + Jetty stack that takes tens of seconds to reach
+REST readiness. The harness can run Batfish two ways:
 cold (one container per trial, JVM cold-start paid every time)
 or warm (one container per bench run via `BatfishService`, JVM
 cold-start paid once). Both regimes are legitimate — cold mirrors
@@ -263,7 +210,7 @@ steady-state solve. `batfish_container_start_s` is the one-off
 `docker run` + `wait_ready` cost attributed to the first trial
 only.
 
-**Fair ratio (headline).** With equivalent work on each side:
+**Fair ratio (primary).** With equivalent work on each side:
 
 ```
 fair_ratio(t) := (batfish_query_routes_s + batfish_query_bgp_s)
@@ -283,10 +230,11 @@ fair_ratio(t) := (batfish_query_routes_s + batfish_query_bgp_s)
 
 Both numerator and denominator measure the analogous unit of
 work — "compute the converged RIB for every (n, v, p) cell and
-materialize it" — on the same two-phase pipeline shape. This is
-the ratio reviewers should cite. When someone wants
+materialize it" — on the same two-phase pipeline shape. If you
+report a speed figure from your own run, this is the ratio to
+report, with the caveats in § 3. When someone wants
 "what speedup does an operator see end-to-end on a fresh
-container?" the `wall_ratio` column beside it is the right
+container?" the `wall_ratio` field beside it is the right
 number; see below.
 
 **Asym ratio (lower bound, retained for audit).** Pairing
@@ -330,13 +278,13 @@ each ratio side-by-side — the reader picks the one their
 question calls for:
 
 - **`arithmetic_mean`** — `sum(ratios) / n`. Legacy baseline;
-  sensitive to small-topology noise (a 2-node rig's 20 ms
-  wall-time has ±50 % jitter that dominates a 16-sample mean).
+  sensitive to small-topology noise (a 2-node rig's
+  millisecond-scale wall time jitters enough to dominate a
+  16-sample mean).
 - **`geometric_mean`** — `exp(mean(log(ratios)))`, computed in
   log space for numerical stability. Unbiased central tendency
-  on a multiplicative scale, and the one reviewers should cite
-  as "typical ratio" when the corpus spans multiple orders of
-  magnitude (our wall-ratio range is 156× to 884×).
+  on a multiplicative scale, and the one to use as "typical
+  ratio" when the ratios span more than an order of magnitude.
 - **`workload_weighted_mean`** — `Σ w_i r_i / Σ w_i` with `w_i`
   equal to the Batfish-side route count. Pulls the headline
   toward production-scale topologies and damps small-rig noise.
@@ -372,7 +320,7 @@ an N-sample `docker-stats` max-over-window. The corpus-level
 in `results/bench_summary.json` carry `max_mb` / `mean_mb` /
 `source` / `sample_count` / `topology_count` across the run, with
 `source: "mixed"` as a sentinel if topologies ever disagree on
-sampler provenance — so the headline memory figures are one JSON
+sampler provenance — so the corpus-level memory figures are one JSON
 hop from the summary, not a walk of `topology_details`.
 
 **What this does not claim.** Agreement between two simulators
@@ -383,85 +331,77 @@ Cross-validation against vendor ground truth is the job of
 
 ## 3. Threats to validity
 
-We flag each of the following so that readers can judge how much
-of the headline ratio they should trust.
+These apply to any timing or agreement figure this harness
+produces, including one from your own run.
 
-- **Variance is measured, but on one host.** The wall-clock
-  columns in § 1 are `mean ± std` over `--trials 5` (the CLI
+- **Variance is measured, but on one host.** The harness's
+  wall-clock fields are `mean ± std` over `--trials 5` (the CLI
   default); per-trial timings are stored under
   `results/<topology>.json` `agreement.trials` + `trial_stats`
   for independent inspection. What we do *not* claim: that the
   distribution is Gaussian, that 5 samples resolve the tail, or
   that a different host would see the same spread. JVM
   first-pass class-loading is the usual source of Batfish
-  variance on small topologies (1–3 s across reruns); it
+  variance on small topologies (seconds across reruns); it
   survives `--trials` because each trial starts a fresh
   container on purpose, so the measured std is an honest
   reflection of what a production user re-running a snapshot
   would see.
 - **JVM cold-start is in the Batfish wall-clock.** Every
   Batfish run starts a fresh `batfish/allinone` container and
-  pays the JVM startup cost (~15–20 s on our host). This is
+  pays the JVM startup cost (tens of seconds). This is
   realistic — most production Batfish users restart between
-  snapshots — but it explains why the 2-node topologies show an
-  inflated `wall_ratio`: most of Batfish's 22–30 s is JVM startup,
-  not simulation. The headline `fair_ratio` defined in § 2
+  snapshots — but it inflates `wall_ratio` on the 2-node
+  topologies, where most of Batfish's wall time is JVM startup,
+  not simulation. The `fair_ratio` defined in § 2
   **already excludes** JVM startup and snapshot upload on the
   Batfish side — numerator is `batfish_query_routes_s +
   batfish_query_bgp_s`, both pybatfish-reported inner times —
-  so the `fair_ratio` column in the § 1 table is what a reader
-  should cite when they want a solver-to-solver apples-to-apples
-  comparison. The `wall_ratio` column is reported alongside as
+  so `fair_ratio` is the field to use for a solver-to-solver
+  comparison. The `wall_ratio` field is reported alongside as
   a conservative upper bound on the speedup an operator would
   observe end-to-end; it gaps `fair_ratio` the most at small
   topologies where JVM startup dominates, and the two converge
   as topology size grows and the JVM-startup share of Batfish
   wall-clock is amortised by accumulated solve time.
-- **Single hardware platform.** All numbers are from one
-  laptop. We do not report x86 vs. arm64, server vs. laptop,
-  or cloud-instance measurements. Absolute times are
-  laptop-specific; *ratios* are more portable, but we have
-  not verified that claim ourselves.
+- **One host per run.** A run measures the host it ran on.
+  Absolute times are host-specific; *ratios* may be more
+  portable, but we have not verified that.
 - **Sim-only mode runs no convergence.** In sim-only mode,
   neither Batfish nor Hammerhead boots a real router, so
   timing does not include protocol convergence. Cross-
-  validation against vendor-produced RIBs is surfaced
-  separately in § 1.1 ("Ground-truth agreement (FRR subset)")
-  when a `--frr-only-truth` run is on record; that mode is
-  Linux-only (it uses containerlab + Docker) and is restricted
-  to FRR-based topologies of ≤ 20 nodes, so the subset is a
-  genuine subset of the corpus, not a replacement for the
-  headline sim-only numbers.
+  validation against vendor-produced RIBs is the job of
+  `--frr-only-truth` (§ 1.1); that mode is Linux-only (it uses
+  containerlab + Docker) and is restricted to FRR-based
+  topologies of ≤ 20 nodes, so it covers a subset of the
+  corpus, not all of it.
 - **Route-count asymmetry is a modeling difference, not
   disagreement.** Batfish materializes /32 loopback host
   routes on every node; Hammerhead elides them on topologies
   whose vendor adapters do not advertise loopbacks as separate
-  /32s. This shows up as sub-100% `Presence` on the
-  `acl-heavy-parse`, `ospf-p2p-3node`, `isis-l1l2-4node`,
-  `ospf-broadcast-4node`, `mpls-l3vpn-4node`, and
-  `mixed-vendor-frr-ceos-4node` rows of § 1, while the larger
-  pure-Clos and BGP-only topologies sit at 100% presence
-  because the /32-loopback set coincides. Because these
+  /32s. This lowers `presence` on the IGP-heavy topologies
+  (OSPF, IS-IS, L3VPN, the mixed-vendor snapshot) but not on
+  the BGP-only Clos topologies, where the /32-loopback sets
+  coincide. Because these
   prefixes are in `B \ H`, they are outside `B ∩ H` and do not
   enter the
   `next_hop_agree(t)` / `protocol_agree(t)` /
   `bgp_attr_agree(t)` metrics of § 2; they *do* lower
   `presence_agree(t)` (Jaccard) because they enlarge the union.
-  The per-topology table in § 1 therefore separates "presence"
-  from the attribute agreement rates, so a reader can see
+  Each `results/<topology>.json` therefore reports "presence"
+  separately from the attribute agreement rates, so a reader can see
   exactly how much of any given gap is modeling asymmetry vs.
   substantive disagreement. This is a deliberate choice; we
   document it rather than post-process one tool's output to
   mirror the other's.
 - **Batfish wall-clock includes pybatfish init + snapshot
-  upload.** We do not subtract these. They are ~1 s on our
-  host, dwarfed by JVM startup at small sizes and by
-  simulation at large sizes. The § 1 table's `Fair ratio`
-  column excludes them on both sides (see § 2 definition —
+  upload.** We do not subtract these. They are small next to
+  JVM startup at small sizes and to simulation at large sizes.
+  `fair_ratio` excludes them on both sides (see § 2 definition —
   numerator is `batfish_query_routes_s + batfish_query_bgp_s`,
   denominator is `hammerhead_simulate_s + hammerhead_rib_total_s`);
-  the `Wall ratio` column includes them on both sides. Both
-  are reported so a reader can judge which one they care about.
+  `wall_ratio` includes them on both sides. Both are reported so
+  a reader can judge which one they care about.
 - **One topology is still gated.** `acl-semantics-3node`
   requires cEOS-lab for the flow-level ACL audit and is
   excluded from the 16-topology count here.
@@ -470,22 +410,18 @@ of the headline ratio they should trust.
   rely on as a sanity check but do not claim as a tested
   invariant of this artifact.
 - **Harness migration history.** The Hammerhead-side denominator
-  was rewritten 2026-04-22 against Hammerhead commit
-  [`b46eb45`](https://github.com/optimesh-ai/hammerhead/commit/b46eb45),
+  was rewritten 2026-04-22 against Hammerhead commit `b46eb45`,
   which introduced `hammerhead simulate --emit-rib all --format
   json`. The pre-migration harness shelled out to
   `hammerhead simulate` for topology + one `hammerhead rib
   --device <h>` subprocess per hostname to materialize FIBs
-  (i.e. N+1 process launches per topology). The numbers shown
-  here — including the headline `fair_ratio` aggregates and
-  every per-topology row in § 1 — use the bulk-emit path, which
-  issues exactly one subprocess per topology and folds RIB
+  (i.e. N+1 process launches per topology). The harness now
+  uses the bulk-emit path, which issues exactly one subprocess
+  per topology and folds RIB
   materialization into the single solve. `hammerhead_rib_total_s`
   is retained in `results/<topology>.json` as `0.0` for schema
   stability; the `asym_ratio` / `fair_ratio` fields therefore
-  converge in the post-migration corpus. See
-  `results/CHANGELOG.md` for the per-topology delta between the
-  last pre-migration run and this one.
+  converge. See `results/CHANGELOG.md` for the harness history.
 
 ## 4. Related work
 
@@ -597,55 +533,57 @@ Per-topology pipeline, sequential, driven by
 - *Static artifacts*. Reports are plain HTML with inlined
   plotly. No web server, no JavaScript build step.
 
-## 7. Reproducing the numbers
+## 7. Running the harness
 
-The artifact is designed to be runnable on a single 16 GB+
-laptop with Docker Desktop.
+The artifact runs on a single 16 GB+ host with Docker.
+
+**Hammerhead needs a licence key from v0.2.0 on.** Request access at
+<https://optimesh.ai/#trial>, then either run
+`hammerhead license install <token>` or export `HAMMERHEAD_LICENSE`
+in the shell you run the bench from (the harness passes its
+environment to the Hammerhead subprocess). Without one, every
+topology fails with `no Hammerhead licence found`; `make preflight`
+warns about it.
 
 ```bash
 git clone <this repo> hammerhead-bench && cd hammerhead-bench
-cp .env.example .env                  # edit $HAMMERHEAD_CLI to your built binary
-docker pull batfish/allinone          # then `docker images --digests` and pin in versions.lock
-make preflight                        # sanity-checks the host
-make smoke                            # one topology end-to-end (~5 min)
-make bench                            # full 16-topology corpus, sim-only (~10 min)
+export HAMMERHEAD_CLI=/path/to/hammerhead   # v0.2.0+ release binary
+make preflight                        # sanity-checks the host, images and licence
+make smoke                            # one topology end-to-end
+make bench                            # full 16-topology corpus, sim-only
 uv run hammerhead-bench report        # regenerate HTML + MD from results/
 open results/report/report.html
 ```
 
-Commands we ran to produce § 1:
+Checked on 2026-10-13: the Hammerhead side of the harness runs
+against the v0.2.0 release with a licence
+(`bench --sim-only --no-batfish`); without one it fails with the
+message above. The Batfish side was not re-run for this revision.
 
-```bash
-# Hammerhead: release build, commit pinned in .env
-cargo build --release -p hammerhead-cli     # from the Hammerhead repo
+Each `results/<topology>.json` carries the topology, status, mode
+and start/finish times, paths to both tools' per-node FIB dumps and
+the per-prefix diff, and an `agreement` block: route and key counts,
+`presence` / `presence_strict`, next-hop / protocol / BGP-attribute
+agreement, the loopback policy and how many rows it reconciled,
+per-trial and summary timings, the ratios of § 2.3, and peak RSS.
+It does not record tool versions; note `hammerhead --version` and
+the Batfish digest yourself.
 
-# Batfish: pinned digest in versions.lock
-docker pull batfish/allinone@sha256:...     # digest is in versions.lock
+**What we pin.** In `versions.lock`: Batfish by digest (the same
+`batfish/allinone@sha256:09817554…` image Hammerhead's parity and
+conformance jobs use; the harness starts that image unless
+`BATFISH_IMAGE` is set), FRR and cEOS by tag. Python dependencies are
+ranges in `pyproject.toml`; `uv.lock` is not committed.
 
-# Measurement
-hammerhead-bench bench --sim-only
-```
-
-Each `results/<topology>.json` file carries: the topology spec
-hash, the versions of both tools, the raw next-hop / protocol /
-BGP-attribute cell counts and means, the raw wall-clock and
-inner-simulate times, and the full diff of the (node, vrf,
-prefix) keys that are in `B \ H`, `H \ B`, and `B ∩ H`.
-
-**What we pin.** Docker image digest for Batfish (in
-`versions.lock`); Hammerhead commit hash (in `.env` as part
-of the CLI path); Python dependencies (`uv.lock`); OS package
-pins for FRR and cEOS in each adapter's Dockerfile.
-
-**What we do not pin.** Host kernel version, host Docker
-version, host hardware. We list our host in § 1; laptop-to-
-laptop variance is not in the scope of this artifact.
+**What we do not pin.** The Hammerhead binary (whatever
+`$HAMMERHEAD_CLI` points at), host kernel, Docker version and
+hardware. Record them alongside any number you publish.
 
 ## 8. Tests
 
 ```bash
 uv sync --all-extras --dev
-uv run pytest                     # 219 passed, 1 skipped
+uv run pytest                     # 278 passed, 1 skipped (2026-10-13)
 uv run ruff check .
 ```
 
@@ -684,26 +622,19 @@ hammerhead-bench report --results-dir results/             # regenerate HTML + M
 
 Beyond the threats in § 3:
 
-- **The corpus tops out at 100 nodes for head-to-head numbers.**
+- **The corpus tops out at 100 nodes for head-to-head runs.**
   `spine-leaf-100node` is the largest topology the bench harness
-  measures end-to-end (Batfish + Hammerhead, shared config
-  directory, shared diff engine). The repo also ships a standalone
-  5,120-switch fixture at `topologies/fat-tree-k64/` with
-  Hammerhead-only timings — 9.3 s median total, 11.6 M FIB
-  entries, ~6.6 GB peak RSS (`hammerhead profile`, 2026-04-22,
-  see that fixture's README) — but it is **not** run through this
-  bench's sim-only loop because marshalling 11.6 M routes through
-  subprocess stdout + `json.loads` costs several GB on the Python
-  side, on top of Hammerhead's own peak RSS; laptops OOM well
-  before Batfish could finish. Batfish has been reported on
-  networks of comparable size by its maintainers, but we have not
-  measured it on 1,000+ -node configs *in this harness*. The
-  **156× wall / 200× fair** ratio at 100 nodes is the most
-  informative single datum for extrapolation; it is the smallest
-  `wall_ratio` we report but sits near the corpus median on
-  `fair_ratio`. Scale-regime readers should weight the
-  20-/50-/100-node rows more heavily than the 2-/3-/4-node rows
-  when extrapolating to production-sized fabrics.
+  runs end-to-end (Batfish + Hammerhead, shared config directory,
+  shared diff engine). The repo also ships a standalone
+  5,120-switch fixture at `topologies/fat-tree-k64/`, but it is
+  **not** run through this bench's sim-only loop: marshalling
+  millions of routes through subprocess stdout + `json.loads`
+  costs several GB on the Python side, on top of Hammerhead's own
+  peak RSS, and laptops run out of memory well before Batfish
+  could finish. We publish no scale or timing figures for that
+  fixture. Batfish has been reported on networks of comparable
+  size by its maintainers; we have not measured it on 1,000+
+  -node configs *in this harness*.
 - **Peak RSS instrumentation is best-effort.** Both sidecars
   now carry `peak_rss_mb` / `peak_rss_source` /
   `peak_rss_sample_count`. Batfish samples via `docker stats
@@ -724,8 +655,8 @@ Beyond the threats in § 3:
 - **Hammerhead is developed by the authors of this
   benchmark.** We have tried to be even-handed in the metric
   definition (§ 2), in the threats-to-validity disclosure
-  (§ 3), and in the conservative framing of the ratio in
-  § 1. The templates, the harness, and the diff engine are
+  (§ 3), and in limiting § 1 to re-runnable results with their
+  caveats. The templates, the harness, and the diff engine are
   source-available; any reader who suspects a methodological
   bias is invited to re-run with a modified harness.
 
@@ -742,14 +673,15 @@ GitHub renders a "Cite this repository" button that consumes it.
   author = {Mallela, Vedu and {Optimesh contributors}},
   year   = {2026},
   howpublished = {\url{https://github.com/optimesh-ai/hammerhead-bench}},
-  note   = {Commit \texttt{a195f09}, accessed 2026-04-21}
+  note   = {Commit \texttt{<the commit you used>}, accessed <date>}
 }
 ```
 
-When citing specific numbers from § 1, please also cite the
-pinned Batfish digest from `versions.lock` and the Hammerhead
-commit hash from your `.env` so the comparison is
-reproducible against the same tool versions.
+When citing a number from § 1, cite the run ID, date and
+Batfish or FRR digest given with it. When reporting your own run,
+cite the `BATFISH_IMAGE` digest from `versions.lock` and the
+output of `hammerhead --version`; the result JSON does not record
+tool versions (§ 7).
 
 ## License
 

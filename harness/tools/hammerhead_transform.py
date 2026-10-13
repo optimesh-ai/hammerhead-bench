@@ -27,7 +27,7 @@ Shape contract (subset of ``hammerhead rib --device <X> --format json``):
       ]
     }
 
-Protocol codes follow Hammerhead's `output.rs::protocol_code`:
+Protocol codes follow Hammerhead's JSON output:
 - ``C`` → connected
 - ``S`` → static
 - ``B`` → bgp (BgpExternal + BgpInternal both collapse to B)
