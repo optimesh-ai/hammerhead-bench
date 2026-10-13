@@ -43,7 +43,7 @@ def test_geometric_mean_log_space_equivalent_for_wide_spread():
 
 
 def test_geometric_mean_handles_three_order_of_magnitude_spread():
-    # Intentionally the spread the bench sees: ~150× to ~700× ratios.
+    # A wide multiplicative spread.
     xs = [150.0, 300.0, 500.0, 700.0]
     got = geometric_mean(xs)
     # log-space mean should sit between 150 and 700, closer to the

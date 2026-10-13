@@ -97,3 +97,25 @@ def test_acl_semantics_gate_loads_mixed_vendor_topology_when_enabled() -> None:
         max_nodes=None,
     )
     assert "acl-semantics-3node" not in _names(hidden)
+
+
+def test_scale_fixture_runs_only_when_named() -> None:
+    # fat-tree-k64 has no node list, so --max-nodes alone would let it
+    # through; it must never join a default or bench-fast run.
+    for max_nodes in (None, 10):
+        specs = _select_topologies(
+            only=set(),
+            skip=set(),
+            with_acl_semantics=False,
+            max_nodes=max_nodes,
+        )
+        assert "fat-tree-k64" not in _names(specs)
+        assert len(specs) == 16 or max_nodes is not None
+
+    named = _select_topologies(
+        only={"fat-tree-k64"},
+        skip=set(),
+        with_acl_semantics=False,
+        max_nodes=None,
+    )
+    assert _names(named) == ["fat-tree-k64"]

@@ -9,8 +9,8 @@ arithmetic mean of per-topology ratios:
   a 200× toy datum.
 * Ratios live on a multiplicative scale. The arithmetic mean of
   ``[2, 8]`` is 5 but the *typical* point is ``sqrt(2·8) = 4`` — the
-  geometric mean. For log-scaled quantities (wall-clock ratios span
-  three orders of magnitude in this corpus) gmean is the unbiased
+  geometric mean. For log-scaled quantities (wall-clock ratios can span
+  orders of magnitude across topologies) gmean is the unbiased
   central-tendency estimator.
 * Tiny topologies have high relative measurement noise. A 2-node rig
   that finishes in 20 ms has a ±10 ms jitter band — enough to swing
@@ -146,9 +146,9 @@ def arithmetic_mean(ratios: Iterable[float]) -> float | None:
 def geometric_mean(ratios: Iterable[float]) -> float | None:
     """``(prod xs)^(1/n)`` computed in log space for numerical stability.
 
-    Why log space: ratios in this corpus span ~150× at k=4 to ~700×
-    at k=20, and the product of 16 such numbers overflows float64 long
-    before we reach the final root. ``exp(mean(log(xs)))`` is
+    Why log space: per-topology ratios can be in the hundreds, and the
+    product of many such numbers can overflow float64 before we reach
+    the final root. ``exp(mean(log(xs)))`` is
     mathematically equivalent and numerically bulletproof.
 
     Returns ``None`` on empty input (no ratios to reduce). Zero and

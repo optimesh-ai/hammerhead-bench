@@ -1,7 +1,7 @@
 """fat-tree-k64 — k=64 fat-tree DC underlay, 5,120 switches.
 
 This is a scale fixture: 1,024 core EOS + 2,048 agg EOS + 2,048 edge
-FRR = **5,120 devices**, 131,072 P2P /30 links, single-area OSPFv2.
+FRR = **5,120 devices**, 67,584 P2P /30 links, single-area OSPFv2.
 Far too large to express as ``tuple[Node, ...]`` + ``tuple[Link, ...]``,
 so it uses the ``TopologySpec.external_renderer`` escape hatch —
 ``generate_fat_tree(64, configs_dir)`` emits every ``<host>.cfg``

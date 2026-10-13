@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import tempfile
 import time
@@ -377,11 +378,36 @@ def _none_or_str(val: Any) -> str | None:
 # ---- orchestration -------------------------------------------------------
 
 
+VERSIONS_LOCK = Path(__file__).resolve().parents[2] / "versions.lock"
+UNPINNED_BATFISH_IMAGE = "batfish/allinone:latest"
+
+
+def default_batfish_image(lock_path: Path = VERSIONS_LOCK) -> str:
+    """``$BATFISH_IMAGE`` if set, else the digest pinned in ``versions.lock``.
+
+    Falls back to the unpinned tag only when neither is available (an
+    installed package without the lockfile, or the placeholder still set).
+    """
+    env = os.environ.get("BATFISH_IMAGE", "").strip()
+    if env:
+        return env
+    try:
+        lines = lock_path.read_text().splitlines()
+    except OSError:
+        return UNPINNED_BATFISH_IMAGE
+    for line in lines:
+        if line.startswith("BATFISH_IMAGE="):
+            value = line.split("=", 1)[1].strip()
+            if value and "PIN_AFTER_FIRST_PULL" not in value:
+                return value
+    return UNPINNED_BATFISH_IMAGE
+
+
 @dataclass(frozen=True, slots=True)
 class BatfishConfig:
     """Everything the runner needs to start Batfish. All fields have sane defaults."""
 
-    image: str = "batfish/allinone:latest"
+    image: str = field(default_factory=default_batfish_image)
     coordinator_port: int = 9997
     service_port: int = 9996
     memory_mb: int = BATFISH_MEMORY_MB

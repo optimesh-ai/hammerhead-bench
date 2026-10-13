@@ -18,8 +18,8 @@ help:
 	@echo "  make install     uv sync (install all deps)"
 	@echo "  make preflight   verify docker / clab / images / RAM"
 	@echo "  make smoke       one-topology end-to-end sanity (phase 2)"
-	@echo "  make bench       full run; respects MAX_NODES env var"
-	@echo "  make bench-fast  skip topologies > 10 nodes and skip cEOS"
+	@echo "  make bench       full sim-only run (extra flags via BENCH_ARGS)"
+	@echo "  make bench-fast  sim-only, topologies of 10 nodes or fewer"
 	@echo "  make report      regenerate HTML/MD from results/ without re-running"
 	@echo "  make clean       docker cleanup + rm results/ + python caches"
 	@echo "  make test        unit tests"
@@ -37,17 +37,14 @@ preflight: install
 smoke: install
 	$(UV) run hammerhead-bench smoke $(SMOKE_ARGS)
 
-bench:
-	@echo "[bench] phase 7+ deliverable. See README.md 'Development order'."
-	@exit 1
+bench: install
+	$(UV) run hammerhead-bench bench --sim-only $(BENCH_ARGS)
 
-bench-fast:
-	@echo "[bench-fast] phase 7+ deliverable. See README.md 'Development order'."
-	@exit 1
+bench-fast: install
+	$(UV) run hammerhead-bench bench --sim-only --max-nodes 10 $(BENCH_ARGS)
 
-report:
-	@echo "[report] phase 9 deliverable. See README.md 'Development order'."
-	@exit 1
+report: install
+	$(UV) run hammerhead-bench report
 
 clean:
 	@echo "[clean] destroying dangling clab containers/networks (if any)..."
