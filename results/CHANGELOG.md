@@ -6,6 +6,17 @@ Hammerhead version and the Batfish digest. Per-topology result files are
 not committed (`results/*` is git-ignored); see README § 1 for the
 numbers we publish.
 
+## 2026-10-15 — checked against Hammerhead v0.2.1
+
+No harness change. `bench --sim-only --no-batfish` (5 trials) was run with
+the v0.2.1 and v0.2.0 aarch64-apple-darwin release binaries, each with a
+licence. Both pass 15 of 16 topologies. `mpls-l3vpn-4node` fails on
+both with the same FRR parse error (`router bgp 65100 vrf RED`, line 47
+of `pe1/frr.conf`). The per-node Hammerhead FIB files under
+`results/hammerhead/` are byte-identical between the two versions
+(only `hammerhead_stats.json` timings differ). Nothing is published from
+this run.
+
 ## 2026-10-13 — April numbers withdrawn; Batfish pinned by digest
 
 **Withdrawn.** The per-topology speed ratios and 100% agreement figures

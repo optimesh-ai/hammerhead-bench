@@ -554,10 +554,12 @@ uv run hammerhead-bench report        # regenerate HTML + MD from results/
 open results/report/report.html
 ```
 
-Checked on 2026-10-13: the Hammerhead side of the harness runs
-against the v0.2.0 release with a licence
-(`bench --sim-only --no-batfish`); without one it fails with the
-message above. The Batfish side was not re-run for this revision.
+Checked on 2026-10-15: the Hammerhead side of the harness runs
+against the v0.2.1 release with a licence
+(`bench --sim-only --no-batfish`, 15 of 16 topologies; `mpls-l3vpn-4node`
+fails to parse on v0.2.0 and v0.2.1 alike); without a licence it fails
+with the message above. The Batfish side was not re-run for this
+revision.
 
 Each `results/<topology>.json` carries the topology, status, mode
 and start/finish times, paths to both tools' per-node FIB dumps and
