@@ -363,6 +363,19 @@ def test_aggregate_sim_only_complete_reduction_is_none_without_complete_topologi
     assert cov["bgp_attr_agreement_mean_covered_complete"] is None
 
 
+def test_aggregate_sim_only_empty_run_still_carries_the_coverage_block() -> None:
+    # Every topology failed before scoring: the block is still there, empty.
+    cov = aggregate_sim_only([])["hammerhead_coverage_summary"]
+    assert cov["complete_topology_count"] == 0
+    assert cov["degraded_topology_count"] == 0
+    assert cov["unknown_topology_count"] == 0
+    assert cov["degraded_topologies"] == []
+    assert cov["covered_complete_topology_count"] == 0
+    assert cov["next_hop_agreement_mean_covered_complete"] is None
+    assert cov["protocol_agreement_mean_covered_complete"] is None
+    assert cov["bgp_attr_agreement_mean_covered_complete"] is None
+
+
 def _metrics(topology: str, hh_nh: float) -> TopologyMetrics:
     return TopologyMetrics(
         topology=topology,
@@ -514,6 +527,10 @@ def test_markdown_flags_degraded_topologies_and_lists_blockers(tmp_path: Path) -
     headline = md.split("## Per-topology", 1)[0]
     assert "coverage complete" in headline
     assert "100.0%" in headline  # nh over "clean" only
+    # The covered-only column drops zero-intersection topologies, so the
+    # text must not claim both other columns keep every topology.
+    assert "keep every topology" not in headline
+    assert "keep degraded topologies" in headline
 
 
 def test_markdown_omits_coverage_section_when_nothing_recorded(tmp_path: Path) -> None:
