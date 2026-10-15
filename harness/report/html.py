@@ -2,7 +2,8 @@
 
 Self-contained single page: Plotly bundle inlined once at the top, three
 figures (per-topology next-hop, per-protocol, per-topology presence),
-headline table, per-topology table, per-protocol table, failure list,
+headline table, per-topology table, per-protocol table, Hammerhead
+coverage gaps (when any topology recorded a verdict), failure list,
 hardware + methodology disclosures, and a link to the raw JSON.
 
 No CDN, no external assets. The resulting file opens cleanly from a
@@ -26,7 +27,7 @@ from plotly import graph_objects as go
 from plotly.offline import get_plotlyjs
 
 from harness.diff.metrics import TopologyMetrics
-from harness.report.data import ReportData, TopologyRow, load_results
+from harness.report.data import ReportData, TopologyRow, hammerhead_coverage, load_results
 from harness.report.plots import match_rate_bar, per_protocol_bar, presence_bar
 
 __all__ = ["render_html", "render_html_report"]
@@ -96,6 +97,7 @@ def render_html(data: ReportData) -> str:
     )
     sections.append(_per_topology_section(data.topologies))
     sections.append(_per_protocol_section(data.metrics))
+    sections.append(_hammerhead_coverage_section(data.topologies))
     sections.append(_failed_section(data.topologies))
     sections.append(_methodology_section())
     sections.append(_hardware_section())
@@ -255,6 +257,55 @@ def _per_protocol_section(metrics: Iterable[TopologyMetrics]) -> str:
         f"<tbody>{''.join(rows)}</tbody>"
         "</table>"
     )
+
+
+def _hammerhead_coverage_section(topologies: list[TopologyRow]) -> str:
+    """Degraded Hammerhead answers + blockers; empty when nothing recorded.
+
+    Mode-agnostic: reads each run's ``hammerhead_coverage_*`` fields, so it
+    also renders for sim-only results, which the tables above do not.
+    """
+    passed = [row for row in topologies if row.run.get("status") == "passed"]
+    verdicts = [(row, hammerhead_coverage(row.run)) for row in passed]
+    recorded = [
+        (row, c) for row, c in verdicts if c.get("hammerhead_coverage_degraded") is not None
+    ]
+    if not recorded:
+        return ""
+    degraded = [
+        (row, c) for row, c in recorded if c.get("hammerhead_coverage_degraded") is True
+    ]
+    counts = (
+        f"Complete: <strong>{len(recorded) - len(degraded)}</strong> &middot; "
+        f"degraded: <strong>{len(degraded)}</strong> &middot; "
+        f"not recorded: <strong>{len(passed) - len(recorded)}</strong>"
+    )
+    intro = (
+        "<p>Hammerhead (v0.2.2+) says when the configs hold lines its model does "
+        "not read. Those answers are still scored and stay in every mean; a low "
+        "agreement on a degraded topology can come from that gap rather than "
+        "from a feature Hammerhead models.</p>"
+    )
+    if not degraded:
+        body = "<p><em>No topology reported degraded coverage.</em></p>"
+    else:
+        items: list[str] = []
+        for row, c in degraded:
+            blockers = c.get("hammerhead_coverage_blockers") or []
+            sub = (
+                "<ul>" + "".join(f"<li>{html.escape(str(b))}</li>" for b in blockers) + "</ul>"
+                if blockers
+                else " no blockers named"
+            )
+            trials = (
+                f"degraded on {int(c.get('hammerhead_coverage_degraded_trials') or 0)} of "
+                f"{int(c.get('hammerhead_coverage_trials') or 0)} trials"
+            )
+            items.append(
+                f"<li><strong>{html.escape(row.topology)}</strong> ({trials}){sub}</li>"
+            )
+        body = f'<ul class="fail-list">{"".join(items)}</ul>'
+    return f'<h2>Hammerhead coverage</h2>{intro}<p class="meta">{counts}</p>{body}'
 
 
 def _failed_section(topologies: list[TopologyRow]) -> str:

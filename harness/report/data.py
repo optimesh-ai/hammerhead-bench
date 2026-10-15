@@ -23,7 +23,7 @@ from typing import Any
 
 from harness.diff.metrics import TopologyMetrics
 
-__all__ = ["ReportData", "TopologyRow", "load_results"]
+__all__ = ["ReportData", "TopologyRow", "hammerhead_coverage", "load_results"]
 
 
 @dataclass(slots=True)
@@ -95,3 +95,16 @@ def _load_metrics(path: Path) -> TopologyMetrics | None:
     # added/removed fields surface as a loud TypeError rather than silently
     # losing data.
     return TopologyMetrics(**data)
+
+
+def hammerhead_coverage(run: dict[str, Any]) -> dict[str, Any]:
+    """The ``hammerhead_coverage_*`` fields of one ``results/<topology>.json``.
+
+    The with-truth path writes them at the top level, frr-only-truth on
+    ``three_way_agreement`` and sim-only on ``agreement``. Empty when the
+    run predates them.
+    """
+    for source in (run, run.get("three_way_agreement") or {}, run.get("agreement") or {}):
+        if "hammerhead_coverage_degraded" in source:
+            return source
+    return {}

@@ -9,7 +9,10 @@ Consumed by the ``hammerhead-bench report`` CLI subcommand. Shape:
    per-topology run JSON so a CI reader sees the cause in-line.
 3. Per-protocol table — mean per-protocol next-hop match rate across the
    run.
-4. Raw-data pointer — relative link to the JSON artifacts.
+4. Hammerhead coverage — topologies whose answer Hammerhead (v0.2.2+)
+   flagged as degraded, with its blockers. Omitted when no topology
+   recorded a verdict.
+5. Raw-data pointer — relative link to the JSON artifacts.
 
 Everything is pure-Python string building; no templating engine required.
 """
@@ -22,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from harness.diff.metrics import TopologyMetrics
-from harness.report.data import ReportData, TopologyRow, load_results
+from harness.report.data import ReportData, TopologyRow, hammerhead_coverage, load_results
 
 __all__ = ["render_markdown", "render_markdown_report"]
 
@@ -76,6 +79,10 @@ def render_markdown(data: ReportData) -> str:
         if truth_section:
             lines.append("")
             lines.extend(truth_section)
+    coverage_block = _hammerhead_coverage_block(data.topologies)
+    if coverage_block:
+        lines.append("")
+        lines.extend(coverage_block)
     lines.append("")
     lines.extend(_failed_block(data.topologies))
     lines.append("")
@@ -112,8 +119,18 @@ def _headline_block(summary: dict[str, Any]) -> list[str]:
     if failed:
         lines.append(f"Failed topologies: **{len(failed)}** — {', '.join(failed)}")
     lines.append("")
-    lines.append("| Metric | Batfish | Hammerhead |")
-    lines.append("|---|---:|---:|")
+    cov = summary.get("hammerhead_coverage_summary") or {}
+    if cov:
+        lines.append(_coverage_counts_line(cov))
+        lines.append("")
+    # The complete-coverage column needs the reduction, not just the counts.
+    complete_col = "hammerhead_next_hop_match_rate_mean_complete" in cov
+    if complete_col:
+        lines.append("| Metric | Batfish | Hammerhead | Hammerhead, coverage complete |")
+        lines.append("|---|---:|---:|---:|")
+    else:
+        lines.append("| Metric | Batfish | Hammerhead |")
+        lines.append("|---|---:|---:|")
     for label, bkey, hkey in [
         (
             "Presence match rate",
@@ -136,9 +153,10 @@ def _headline_block(summary: dict[str, Any]) -> list[str]:
             "hammerhead_bgp_attr_match_rate_mean",
         ),
     ]:
-        lines.append(
-            f"| {label} | {_fmt_rate(summary.get(bkey))} | {_fmt_rate(summary.get(hkey))} |"
-        )
+        row = f"| {label} | {_fmt_rate(summary.get(bkey))} | {_fmt_rate(summary.get(hkey))} |"
+        if complete_col:
+            row += f" {_fmt_rate(cov.get(f'{hkey}_complete'))} |"
+        lines.append(row)
     return lines
 
 
@@ -164,24 +182,45 @@ def _sim_only_headline_block(summary: dict[str, Any]) -> list[str]:
         lines.append(f"Failed topologies: **{len(failed)}** — {', '.join(failed)}")
         lines.append("")
     mean_cov = summary.get("mean_coverage")
-    lines.append("| Metric | Naive (all topologies) | Covered only |")
-    lines.append("|---|---:|---:|")
-    lines.append(
-        f"| Next-hop agreement | "
-        f"{_fmt_rate(summary.get('next_hop_agreement_mean'))} | "
-        f"{_fmt_rate(summary.get('next_hop_agreement_mean_covered'))} |"
-    )
-    lines.append(
-        f"| Protocol agreement | "
-        f"{_fmt_rate(summary.get('protocol_agreement_mean'))} | "
-        f"{_fmt_rate(summary.get('protocol_agreement_mean_covered'))} |"
-    )
-    lines.append(
-        f"| BGP attribute agreement | "
-        f"{_fmt_rate(summary.get('bgp_attr_agreement_mean'))} | "
-        f"{_fmt_rate(summary.get('bgp_attr_agreement_mean_covered'))} |"
-    )
-    lines.append(f"| Mean coverage `|B∩H|/|B∪H|` | {_fmt_rate(mean_cov)} | — |")
+    cov = summary.get("hammerhead_coverage_summary") or {}
+    # The frr-only-truth summary carries the counts but not the reduction.
+    complete_col = "covered_complete_topology_count" in cov
+    if complete_col:
+        lines.append(
+            _coverage_counts_line(cov)
+            + " The last column repeats the covered-only means over the "
+            f"**{cov.get('covered_complete_topology_count', 0)}** covered "
+            "topologies whose Hammerhead coverage was complete (`-` when there "
+            "are none); the other two keep every topology."
+        )
+        lines.append("")
+    elif cov:
+        lines.append(_coverage_counts_line(cov))
+        lines.append("")
+    if complete_col:
+        lines.append(
+            "| Metric | Naive (all topologies) | Covered only | "
+            "Covered, coverage complete |"
+        )
+        lines.append("|---|---:|---:|---:|")
+    else:
+        lines.append("| Metric | Naive (all topologies) | Covered only |")
+        lines.append("|---|---:|---:|")
+    for label, key in [
+        ("Next-hop agreement", "next_hop_agreement"),
+        ("Protocol agreement", "protocol_agreement"),
+        ("BGP attribute agreement", "bgp_attr_agreement"),
+    ]:
+        row = (
+            f"| {label} | "
+            f"{_fmt_rate(summary.get(f'{key}_mean'))} | "
+            f"{_fmt_rate(summary.get(f'{key}_mean_covered'))} |"
+        )
+        if complete_col:
+            row += f" {_fmt_rate(cov.get(f'{key}_mean_covered_complete'))} |"
+        lines.append(row)
+    cov_row = f"| Mean coverage `|B∩H|/|B∪H|` | {_fmt_rate(mean_cov)} | — |"
+    lines.append(cov_row + (" — |" if complete_col else ""))
     lines.append("")
     bf_wall = summary.get("total_batfish_wall_s", 0.0) or 0.0
     hh_wall = summary.get("total_hammerhead_wall_s", 0.0) or 0.0
@@ -218,6 +257,9 @@ def _sim_only_per_topology_table(topologies: list[TopologyRow]) -> list[str]:
     - ``Fair ratio`` — ``batfish_simulate_s / (hammerhead_simulate_s +
       hammerhead_rib_total_s)`` (apples-to-apples; the one we recommend
       citing, formal definition in README § 2).
+    - ``HH coverage`` — Hammerhead's own coverage verdict (v0.2.2+):
+      ``complete``, ``**degraded**`` (scored, but its configs hold lines
+      the model does not read), or ``-`` when not recorded.
 
     The legacy "solve ratio" column is deliberately dropped: it paired
     Batfish's solve-plus-materialize against Hammerhead's solve-only and
@@ -234,10 +276,10 @@ def _sim_only_per_topology_table(topologies: list[TopologyRow]) -> list[str]:
     lines.append(
         "| Topology | Status | Nodes | Routes (bf / hh) | "
         "Presence | NH agree | BF wall (s) | HH wall (s) | "
-        "Wall ratio | Fair ratio |"
+        "Wall ratio | Fair ratio | HH coverage |"
     )
     lines.append(
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|"
     )
     for row in topologies:
         status = row.run.get("status", "?")
@@ -245,7 +287,7 @@ def _sim_only_per_topology_table(topologies: list[TopologyRow]) -> list[str]:
         if not agreement:
             lines.append(
                 f"| {row.topology} | {status} | "
-                "- | - | - | - | - | - | - | - |"
+                "- | - | - | - | - | - | - | - | - |"
             )
             continue
         trial_stats = agreement.get("trial_stats") or {}
@@ -291,7 +333,8 @@ def _sim_only_per_topology_table(topologies: list[TopologyRow]) -> list[str]:
             f"{bf_wall_cell} | "
             f"{hh_wall_cell} | "
             f"{_fmt_solve_ratio(wall_ratio)} | "
-            f"{_fmt_solve_ratio(fair_ratio)} |"
+            f"{_fmt_solve_ratio(fair_ratio)} | "
+            f"{_fmt_hh_coverage(row.run)} |"
         )
     lines.append("")
     lines.append(
@@ -313,13 +356,16 @@ def _per_topology_table(topologies: list[TopologyRow]) -> list[str]:
         "| Topology | Status | "
         "Batfish NH | Hammerhead NH | "
         "Batfish proto | Hammerhead proto | "
-        "Batfish BGP | Hammerhead BGP |"
+        "Batfish BGP | Hammerhead BGP | HH coverage |"
     )
-    lines.append("|---|---|---:|---:|---:|---:|---:|---:|")
+    lines.append("|---|---|---:|---:|---:|---:|---:|---:|---|")
     for row in topologies:
         status = row.run.get("status", "?")
         if row.metrics is None:
-            lines.append(f"| {row.topology} | {status} | - | - | - | - | - | - |")
+            lines.append(
+                f"| {row.topology} | {status} | - | - | - | - | - | - | "
+                f"{_fmt_hh_coverage(row.run)} |"
+            )
             continue
         m = row.metrics
         lines.append(
@@ -329,7 +375,8 @@ def _per_topology_table(topologies: list[TopologyRow]) -> list[str]:
             f"{_fmt_rate(m.batfish_protocol_match_rate)} | "
             f"{_fmt_rate(m.hammerhead_protocol_match_rate)} | "
             f"{_fmt_rate(m.batfish_bgp_attr_match_rate)} | "
-            f"{_fmt_rate(m.hammerhead_bgp_attr_match_rate)} |"
+            f"{_fmt_rate(m.hammerhead_bgp_attr_match_rate)} | "
+            f"{_fmt_hh_coverage(row.run)} |"
         )
     return lines
 
@@ -396,9 +443,10 @@ def _truth_section(topologies: list[TopologyRow]) -> list[str]:
     lines.append("")
     lines.append(
         "| Topology | Truth routes | B vs T presence | B vs T NH | "
-        "H vs T presence | H vs T NH | B vs H presence | B vs H NH |"
+        "H vs T presence | H vs T NH | B vs H presence | B vs H NH | "
+        "HH coverage |"
     )
-    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---|")
     for row in rows_with_truth:
         a = row.run.get("three_way_agreement") or {}
         lines.append(
@@ -409,8 +457,59 @@ def _truth_section(topologies: list[TopologyRow]) -> list[str]:
             f"{_fmt_rate(a.get('hammerhead_vs_truth_presence'))} | "
             f"{_fmt_rate(a.get('hammerhead_vs_truth_next_hop'))} | "
             f"{_fmt_rate(a.get('batfish_vs_hammerhead_presence'))} | "
-            f"{_fmt_rate(a.get('batfish_vs_hammerhead_next_hop'))} |"
+            f"{_fmt_rate(a.get('batfish_vs_hammerhead_next_hop'))} | "
+            f"{_fmt_hh_coverage(row.run)} |"
         )
+    return lines
+
+
+def _hammerhead_coverage_block(topologies: list[TopologyRow]) -> list[str]:
+    """Degraded Hammerhead answers and their blockers — omitted when unknown.
+
+    Rendered only when at least one passed topology recorded a coverage
+    verdict (Hammerhead v0.2.2+), so reports over older results are
+    unchanged. Degraded topologies are scored like any other; this block
+    is where a reader finds which ones and why.
+    """
+    passed = [row for row in topologies if row.run.get("status") == "passed"]
+    verdicts = [(row, hammerhead_coverage(row.run)) for row in passed]
+    recorded = [
+        (row, c) for row, c in verdicts if c.get("hammerhead_coverage_degraded") is not None
+    ]
+    if not recorded:
+        return []
+    degraded = [
+        (row, c) for row, c in recorded if c.get("hammerhead_coverage_degraded") is True
+    ]
+    lines = ["## Hammerhead coverage"]
+    lines.append("")
+    lines.append(
+        "Hammerhead (v0.2.2+) says when the configs hold lines its model does "
+        "not read. Those answers are still scored and stay in every mean "
+        "above except the headline's \"coverage complete\" column; a low "
+        "agreement on a degraded topology can come from that gap rather than "
+        "from a feature Hammerhead models."
+    )
+    lines.append("")
+    lines.append(
+        f"Complete: **{len(recorded) - len(degraded)}** · "
+        f"degraded: **{len(degraded)}** · "
+        f"not recorded: **{len(passed) - len(recorded)}**"
+    )
+    lines.append("")
+    if not degraded:
+        lines.append("_No topology reported degraded coverage._")
+        return lines
+    for row, c in degraded:
+        blockers = c.get("hammerhead_coverage_blockers") or []
+        trials = (
+            f"degraded on {c.get('hammerhead_coverage_degraded_trials', 0)} of "
+            f"{c.get('hammerhead_coverage_trials', 0)} trials"
+        )
+        suffix = ":" if blockers else ": no blockers named"
+        lines.append(f"- **{row.topology}** ({trials}){suffix}")
+        for b in blockers:
+            lines.append(f"    - {b}")
     return lines
 
 
@@ -432,6 +531,23 @@ def _failed_block(topologies: list[TopologyRow]) -> list[str]:
 
 
 # ---- helpers -------------------------------------------------------------
+
+
+def _fmt_hh_coverage(run: dict[str, Any]) -> str:
+    degraded = hammerhead_coverage(run).get("hammerhead_coverage_degraded")
+    if degraded is True:
+        return "**degraded**"
+    if degraded is False:
+        return "complete"
+    return "-"
+
+
+def _coverage_counts_line(cov: dict[str, Any]) -> str:
+    return (
+        f"Hammerhead coverage: **{cov.get('complete_topology_count', 0)}** complete · "
+        f"**{cov.get('degraded_topology_count', 0)}** degraded · "
+        f"**{cov.get('unknown_topology_count', 0)}** not recorded."
+    )
 
 
 def _fmt_rate(r: float | None) -> str:

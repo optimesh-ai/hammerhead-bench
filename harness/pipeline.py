@@ -21,10 +21,11 @@ without requiring a Linux VM.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from harness.adapters.bridge import BridgeAdapter
 from harness.adapters.ceos import CeosAdapter
@@ -68,6 +69,13 @@ class TopologyRunResult:
     error: str | None = None
     notes: list[str] = field(default_factory=list)
     memory_samples: list[MemorySample] = field(default_factory=list)
+    # Hammerhead's coverage verdict for the answer that was scored; see
+    # :func:`_rollup_hammerhead_coverage` for the semantics.
+    hammerhead_coverage_status: str | None = None
+    hammerhead_coverage_degraded: bool | None = None
+    hammerhead_coverage_blockers: list[str] | None = None
+    hammerhead_coverage_degraded_trials: int = 0
+    hammerhead_coverage_trials: int = 0
 
 
 # Injectable simulator hooks. Each takes (configs_dir, out_dir, topology)
@@ -261,6 +269,10 @@ def run_topology(  # noqa: PLR0915 — phased pipeline; refactor scheduled for p
             hh_dir.mkdir(parents=True, exist_ok=True)
             hooks.hammerhead(configs_dir, hh_dir, spec.name)
             result.hammerhead_path = hh_dir
+            _apply_hammerhead_coverage(
+                result,
+                [_read_hammerhead_coverage(hh_dir / "hammerhead_stats.json")],
+            )
 
         if hooks.batfish is not None or hooks.hammerhead is not None:
             log.info("[%s] computing diff", spec.name)
@@ -567,6 +579,18 @@ class SimOnlyAgreement:
     both_sides_keys_strict: int | None = None
     trials: dict | None = None
     trial_stats: dict | None = None
+    # Hammerhead's own coverage verdict (v0.2.2+), rolled up over the
+    # trials by :func:`_rollup_hammerhead_coverage`. Not to be confused
+    # with :attr:`coverage` below, which is the B/H key-set Jaccard. A
+    # degraded topology is still scored; these fields flag it so
+    # :func:`aggregate_sim_only` and the report can tell it apart.
+    # ``hammerhead_coverage_degraded`` is ``None`` when the verdict was
+    # not recorded on every trial (Hammerhead before v0.2.2).
+    hammerhead_coverage_status: str | None = None
+    hammerhead_coverage_degraded: bool | None = None
+    hammerhead_coverage_blockers: list[str] | None = None
+    hammerhead_coverage_degraded_trials: int = 0
+    hammerhead_coverage_trials: int = 0
 
     @property
     def coverage(self) -> float:
@@ -777,6 +801,7 @@ def run_topology_sim_only(  # noqa: PLR0912, PLR0915 — trial loop honours pers
         hammer_peaks: list[int] = []
         hammer_peak_sources: list[str] = []
         hammer_peak_samples: list[int] = []
+        hammer_coverages: list[_CoverageVerdict] = []
 
         # Service takes precedence over the plain callable. Accepting both
         # is intentional — tests inject a simple callable, CI plumbs a
@@ -887,6 +912,7 @@ def run_topology_sim_only(  # noqa: PLR0912, PLR0915 — trial loop honours pers
                     hammer_peak_sources.append(peak_source)
                 if peak_samples is not None and peak_samples > 0:
                     hammer_peak_samples.append(peak_samples)
+                hammer_coverages.append(_read_hammerhead_coverage(sidecar))
 
         agreement = _compute_sim_only_agreement(
             spec=spec,
@@ -905,6 +931,7 @@ def run_topology_sim_only(  # noqa: PLR0912, PLR0915 — trial loop honours pers
             batfish_peak_samples=batfish_peak_samples,
             hammerhead_peak_sources=hammer_peak_sources,
             hammerhead_peak_samples=hammer_peak_samples,
+            hammerhead_coverages=hammer_coverages,
             batfish_warms=batfish_warms,
             batfish_container_start_s=(
                 bf_service.container_start_s  # type: ignore[attr-defined]
@@ -950,6 +977,7 @@ def _compute_sim_only_agreement(  # noqa: PLR0912, PLR0915 — reference-canonic
     batfish_peak_samples: list[int] | None = None,
     hammerhead_peak_sources: list[str] | None = None,
     hammerhead_peak_samples: list[int] | None = None,
+    hammerhead_coverages: list[_CoverageVerdict] | None = None,
     batfish_warms: list[bool] | None = None,
     batfish_container_start_s: float | None = None,
 ) -> SimOnlyAgreement:
@@ -1172,6 +1200,7 @@ def _compute_sim_only_agreement(  # noqa: PLR0912, PLR0915 — reference-canonic
         both_sides_keys_strict=len(strict_both),
         trials=trials_payload,
         trial_stats=stats_payload,
+        **_rollup_hammerhead_coverage(hammerhead_coverages or []),
     )
 
     diff_dir.mkdir(parents=True, exist_ok=True)
@@ -1445,6 +1474,84 @@ def _read_int_stat(path: Path, key: str) -> int | None:
         return None
 
 
+#: One trial's coverage verdict as ``hammerhead_stats.json`` records it:
+#: ``(coverage_status, coverage_degraded, coverage_blockers)``, each ``None``
+#: when the sidecar does not carry it (Hammerhead before v0.2.2).
+_CoverageVerdict = tuple[str | None, bool | None, list[str] | None]
+
+
+def _read_hammerhead_coverage(path: Path) -> _CoverageVerdict:
+    """Read one trial's coverage verdict out of ``hammerhead_stats.json``.
+
+    A value of the wrong type reads as ``None`` (not recorded) instead of
+    being coerced, so a malformed ``coverage_degraded`` can never pass for
+    a complete verdict.
+    """
+    import json  # noqa: PLC0415
+
+    if not path.exists():
+        return (None, None, None)
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return (None, None, None)
+    if not isinstance(data, dict):
+        return (None, None, None)
+    status = data.get("coverage_status")
+    degraded = data.get("coverage_degraded")
+    blockers = data.get("coverage_blockers")
+    return (
+        status if isinstance(status, str) and status else None,
+        degraded if isinstance(degraded, bool) else None,
+        [str(b) for b in blockers] if isinstance(blockers, list) else None,
+    )
+
+
+def _rollup_hammerhead_coverage(verdicts: list[_CoverageVerdict]) -> dict:
+    """Roll per-trial coverage verdicts up to one verdict per topology.
+
+    Returns the ``hammerhead_coverage_*`` fields shared by
+    :class:`SimOnlyAgreement`, :class:`ThreeWayAgreement` and
+    :class:`TopologyRunResult`:
+
+    * ``degraded`` — ``True`` if any trial was degraded; ``False`` only if
+      every trial recorded complete coverage; ``None`` otherwise (no
+      Hammerhead trial, or a trial without a verdict, as before v0.2.2).
+    * ``status`` — Hammerhead's own word for that verdict: the first
+      degraded trial's, else the last trial's when all were complete.
+    * ``blockers`` — the union across trials, de-duplicated in order;
+      ``None`` when no trial recorded any.
+    * ``degraded_trials`` / ``trials`` — how many of the Hammerhead trials
+      were degraded, out of how many ran.
+    """
+    degraded_statuses = [s for s, d, _ in verdicts if d is True]
+    degraded: bool | None
+    if degraded_statuses:
+        degraded = True
+        status = degraded_statuses[0] or "degraded"
+    elif verdicts and all(d is False for _, d, _ in verdicts):
+        degraded = False
+        status = verdicts[-1][0]
+    else:
+        degraded = None
+        status = None
+    recorded = [b for _, _, b in verdicts if b is not None]
+    blockers = list(dict.fromkeys(x for bs in recorded for x in bs)) if recorded else None
+    return {
+        "hammerhead_coverage_status": status,
+        "hammerhead_coverage_degraded": degraded,
+        "hammerhead_coverage_blockers": blockers,
+        "hammerhead_coverage_degraded_trials": len(degraded_statuses),
+        "hammerhead_coverage_trials": len(verdicts),
+    }
+
+
+def _apply_hammerhead_coverage(target: object, verdicts: list[_CoverageVerdict]) -> None:
+    """Set the rolled-up ``hammerhead_coverage_*`` fields on ``target``."""
+    for name, value in _rollup_hammerhead_coverage(verdicts).items():
+        setattr(target, name, value)
+
+
 # 100ms tolerance: measurement noise between the outer monotonic and the
 # inner sidecar stamp is single-digit ms on every host we've seen; anything
 # larger means ``simulate_s`` has been mis-aliased to a wall-clock stat
@@ -1553,6 +1660,14 @@ class ThreeWayAgreement:
     batfish_vs_hammerhead_next_hop: float = 1.0
     batfish_vs_hammerhead_protocol: float = 1.0
     batfish_vs_hammerhead_bgp_attr: float = 1.0
+
+    # Hammerhead's coverage verdict for the scored answer; same semantics
+    # as on :class:`SimOnlyAgreement`.
+    hammerhead_coverage_status: str | None = None
+    hammerhead_coverage_degraded: bool | None = None
+    hammerhead_coverage_blockers: list[str] | None = None
+    hammerhead_coverage_degraded_trials: int = 0
+    hammerhead_coverage_trials: int = 0
 
     def as_dict(self) -> dict:
         from dataclasses import asdict  # noqa: PLC0415
@@ -1788,6 +1903,12 @@ def run_topology_frr_only_truth(
             hammerhead_simulate_s=hh_sim,
             hammerhead_rib_total_s=hh_rib,
             hammerhead_simulate_plus_rib_s=hh_sim_plus_rib,
+            # One Hammerhead trial on this path; none when the hook is unset.
+            hammerhead_coverages=(
+                [_read_hammerhead_coverage(hh_dir / "hammerhead_stats.json")]
+                if hooks.hammerhead is not None
+                else []
+            ),
         )
         result.three_way_agreement = agreement
         result.diff_path = diff_dir
@@ -1813,6 +1934,7 @@ def _compute_three_way_agreement(
     hammerhead_simulate_s: float | None,
     hammerhead_rib_total_s: float | None = None,
     hammerhead_simulate_plus_rib_s: float | None = None,
+    hammerhead_coverages: list[_CoverageVerdict] | None = None,
 ) -> ThreeWayAgreement:
     """Diff all three pairs, persist records + agreement.json.
 
@@ -1866,6 +1988,7 @@ def _compute_three_way_agreement(
         batfish_vs_hammerhead_next_hop=bh["next_hop"],
         batfish_vs_hammerhead_protocol=bh["protocol"],
         batfish_vs_hammerhead_bgp_attr=bh["bgp_attr"],
+        **_rollup_hammerhead_coverage(hammerhead_coverages or []),
     )
 
     diff_dir.mkdir(parents=True, exist_ok=True)
@@ -1913,6 +2036,40 @@ def _pairwise_agreement(ix_x: dict, ix_y: dict) -> dict[str, float | int]:
     }
 
 
+def summarize_hammerhead_coverage(per_topology: Iterable[Any]) -> dict:
+    """Corpus roll-up of each scored topology's Hammerhead coverage verdict.
+
+    ``per_topology`` holds anything carrying the ``hammerhead_coverage_*``
+    fields (:class:`SimOnlyAgreement`, :class:`ThreeWayAgreement`,
+    :class:`TopologyRunResult`). Degraded topologies stay in every score;
+    this block says which they are and why, so a reader can see how much
+    of a headline rests on answers Hammerhead itself flagged as reading
+    the configs only in part. ``unknown`` counts topologies with no
+    recorded verdict (Hammerhead before v0.2.2, or no Hammerhead run).
+    """
+    items = list(per_topology)
+    degraded = [x for x in items if x.hammerhead_coverage_degraded is True]
+    return {
+        "complete_topology_count": sum(
+            1 for x in items if x.hammerhead_coverage_degraded is False
+        ),
+        "degraded_topology_count": len(degraded),
+        "unknown_topology_count": sum(
+            1 for x in items if x.hammerhead_coverage_degraded is None
+        ),
+        "degraded_topologies": [
+            {
+                "topology": x.topology,
+                "status": x.hammerhead_coverage_status,
+                "blockers": list(x.hammerhead_coverage_blockers or []),
+                "degraded_trials": x.hammerhead_coverage_degraded_trials,
+                "trials": x.hammerhead_coverage_trials,
+            }
+            for x in degraded
+        ],
+    }
+
+
 def aggregate_sim_only(per_topology: list[SimOnlyAgreement]) -> dict:
     """Bench summary with both naive and coverage-honest agreement means.
 
@@ -1933,6 +2090,17 @@ def aggregate_sim_only(per_topology: list[SimOnlyAgreement]) -> dict:
     ``mean_coverage`` is the arithmetic mean of per-topology Jaccard
     coverage; a low value flags how much of the summary is running on
     empty intersections.
+
+    ``hammerhead_coverage_summary`` is about a different coverage:
+    Hammerhead's own verdict on whether it read every config line
+    (v0.2.2+). Both means above keep degraded topologies in, since
+    Hammerhead answered them and dropping them would flatter the tool
+    under test. The block counts each verdict, lists the degraded
+    topologies with their blockers, and repeats the ``_covered`` means
+    over covered topologies whose coverage was complete, as
+    ``*_mean_covered_complete`` with ``covered_complete_topology_count``.
+    Those means are ``None``, not a vacuous 1.0, when no topology
+    qualifies (e.g. every verdict is unknown).
     """
     n = len(per_topology)
     if n == 0:
@@ -1942,6 +2110,22 @@ def aggregate_sim_only(per_topology: list[SimOnlyAgreement]) -> dict:
         return sum(xs) / len(xs) if xs else 1.0
 
     covered = [a for a in per_topology if a.both_sides_keys > 0]
+    covered_complete = [a for a in covered if a.hammerhead_coverage_degraded is False]
+    hammerhead_coverage_summary = summarize_hammerhead_coverage(per_topology)
+    hammerhead_coverage_summary.update(
+        {
+            "covered_complete_topology_count": len(covered_complete),
+            "next_hop_agreement_mean_covered_complete": _mean_or_none(
+                [a.next_hop_agreement for a in covered_complete]
+            ),
+            "protocol_agreement_mean_covered_complete": _mean_or_none(
+                [a.protocol_agreement for a in covered_complete]
+            ),
+            "bgp_attr_agreement_mean_covered_complete": _mean_or_none(
+                [a.bgp_attr_agreement for a in covered_complete]
+            ),
+        }
+    )
 
     # Trial count is uniform across topologies within a single bench run
     # (CLI passes --trials N to every topology). Surface it at the summary
@@ -2083,5 +2267,8 @@ def aggregate_sim_only(per_topology: list[SimOnlyAgreement]) -> dict:
         # number of topologies that produced any reading at all.
         "batfish_peak_rss_summary": batfish_peak_rss_summary,
         "hammerhead_peak_rss_summary": hammerhead_peak_rss_summary,
+        # Hammerhead's own coverage verdicts (see docstring): counts,
+        # degraded topologies + blockers, complete-coverage-only means.
+        "hammerhead_coverage_summary": hammerhead_coverage_summary,
         "topology_details": [a.as_dict() for a in per_topology],
     }

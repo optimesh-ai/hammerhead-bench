@@ -6,6 +6,33 @@ Hammerhead version and the Batfish digest. Per-topology result files are
 not committed (`results/*` is git-ignored); see README § 1 for the
 numbers we publish.
 
+## 2026-10-15 — degraded Hammerhead coverage flagged in scores
+
+**Harness change; no numbers move.** Hammerhead v0.2.2 marks an
+answer whose configs hold lines its model does not read (`simulate`
+exits 3 and prints a `coverage` object), and the harness already
+recorded that verdict in `hammerhead_stats.json`. It is now carried
+into everything that scores the answer:
+
+- Per-topology agreements (sim-only `agreement`, `--frr-only-truth`
+  `three_way_agreement`, and with-truth `results/<topology>.json`)
+  gain `hammerhead_coverage_status`, `hammerhead_coverage_degraded`,
+  `hammerhead_coverage_blockers`, `hammerhead_coverage_degraded_trials`
+  and `hammerhead_coverage_trials`. Any degraded trial flags the
+  topology; it is complete only if every trial was.
+- `bench_summary.json` gains `hammerhead_coverage_summary`: counts per
+  verdict, the degraded topologies with their blockers, and the
+  agreement (sim-only) or Hammerhead match-rate (with-truth) means
+  over complete-coverage topologies only, `null` when there are none.
+- The Markdown report adds an `HH coverage` column, a "coverage
+  complete" headline column and a "Hammerhead coverage" section
+  listing blockers; the HTML report adds the section.
+
+Degraded topologies are flagged, not excluded: every existing mean,
+ratio and table keeps them (README § 2.4, § 3). Against Hammerhead
+v0.2.1 or older every verdict is `null`, so the new means are `null`
+and the existing ones are unchanged.
+
 ## 2026-10-15 — checked against Hammerhead v0.2.1
 
 No harness change. `bench --sim-only --no-batfish` (5 trials) was run with
