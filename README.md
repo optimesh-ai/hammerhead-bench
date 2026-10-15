@@ -297,6 +297,38 @@ topologies (ratio undefined, non-positive, or non-finite) are
 moved to `excluded` with the exclusion reason verbatim, and
 their samples never feed any reducer.
 
+**Hammerhead coverage.** From v0.2.2 Hammerhead says, per answer,
+whether the configs hold lines its model does not read (§ 7). Not
+to be confused with `coverage` / `mean_coverage` above, which is
+the key-set Jaccard of § 2.2. A degraded answer is scored like any
+other and stays in every mean and ratio summary: Hammerhead is the
+tool under test, and dropping the topologies it read only in part
+would flatter it. Each `bench_summary.json` instead carries a
+`hammerhead_coverage_summary` block over the scored topologies:
+
+- `complete_topology_count`, `degraded_topology_count` and
+  `unknown_topology_count` (no recorded verdict: Hammerhead before
+  v0.2.2, or no Hammerhead run);
+- `degraded_topologies`, one `{topology, status, blockers,
+  degraded_trials, trials}` entry per degraded topology, with
+  Hammerhead's blockers verbatim;
+- sim-only: `next_hop_agreement_mean_covered_complete`,
+  `protocol_agreement_mean_covered_complete` and
+  `bgp_attr_agreement_mean_covered_complete`, the `_covered` means
+  repeated over the `covered_complete_topology_count` covered
+  topologies whose coverage was complete;
+- with-truth: `hammerhead_{presence,next_hop,protocol,bgp_attr}_match_rate_mean_complete`,
+  the Hammerhead headline means over the complete-coverage
+  topologies.
+
+The complete-coverage means are `null`, never a vacuous 100%, when
+no topology qualifies, which is every run against a Hammerhead
+older than v0.2.2. A topology is degraded if any of its trials
+was, and complete only if every trial recorded complete coverage.
+The `--frr-only-truth` summary carries the counts and the list
+(its fallback topologies also get the full block inside
+`sim_only_summary`).
+
 ### 2.5 Memory (peak RSS)
 
 Both sidecars now carry `peak_rss_mb` + `peak_rss_source` +
@@ -332,6 +364,16 @@ Cross-validation against vendor ground truth is the job of
 
 These apply to any timing or agreement figure this harness
 produces, including one from your own run.
+
+- **A degraded Hammerhead answer is scored, not dropped.** When
+  Hammerhead (v0.2.2+) reports that a topology's configs hold
+  lines its model does not read, its RIBs are still diffed and
+  counted, so an agreement figure can include answers built
+  without those lines. `hammerhead_coverage_summary` (§ 2.4) says
+  how many topologies that is and repeats the agreement means
+  without them; the report flags each one. Timings and ratios are
+  not coverage-filtered: a run that skipped lines may have done
+  less work.
 
 - **Variance is measured, but on one host.** The harness's
   wall-clock fields are `mean ± std` over `--trials 5` (the CLI
@@ -570,12 +612,27 @@ carries `coverage_status`, `coverage_degraded` and
 3 whose JSON does not say `coverage.degraded`, or any other non-zero
 code, still fails the run.
 
+The flag follows the score. Every per-topology agreement (and, on
+the with-truth path, `results/<topology>.json` itself) rolls the
+trials up into `hammerhead_coverage_status`,
+`hammerhead_coverage_degraded` (`true` if any trial was degraded,
+`false` only if every trial was complete, else `null`),
+`hammerhead_coverage_blockers`, `hammerhead_coverage_degraded_trials`
+and `hammerhead_coverage_trials`. `bench_summary.json` adds the
+`hammerhead_coverage_summary` block of § 2.4. The Markdown report
+gives each topology an `HH coverage` column, adds a
+"coverage complete" column to the headline, and lists every
+degraded topology with its blockers under "Hammerhead coverage";
+the HTML report carries the same list. The bench also prints a
+warning line for each degraded topology.
+
 Each `results/<topology>.json` carries the topology, status, mode
 and start/finish times, paths to both tools' per-node FIB dumps and
 the per-prefix diff, and an `agreement` block: route and key counts,
 `presence` / `presence_strict`, next-hop / protocol / BGP-attribute
 agreement, the loopback policy and how many rows it reconciled,
-per-trial and summary timings, the ratios of § 2.3, and peak RSS.
+per-trial and summary timings, the ratios of § 2.3, peak RSS, and
+Hammerhead's coverage verdict (`hammerhead_coverage_*`, above).
 It does not record tool versions; note `hammerhead --version` and
 the Batfish digest yourself.
 
@@ -593,7 +650,7 @@ hardware. Record them alongside any number you publish.
 
 ```bash
 uv sync --all-extras --dev
-uv run pytest                     # 279 passed, 1 skipped (2026-10-13)
+uv run pytest                     # 300 passed, 1 skipped (2026-10-15)
 uv run ruff check .
 ```
 

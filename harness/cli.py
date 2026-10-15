@@ -28,10 +28,12 @@ from harness.pipeline import (
     SimOnlyAgreement,
     SimOnlyResult,
     ThreeWayAgreement,
+    TopologyRunResult,
     aggregate_sim_only,
     run_topology,
     run_topology_frr_only_truth,
     run_topology_sim_only,
+    summarize_hammerhead_coverage,
 )
 from harness.tools.batfish import BatfishService, run_batfish
 from harness.tools.hammerhead import run_hammerhead
@@ -140,8 +142,54 @@ def _write_run_result(result, results_dir: Path) -> None:
         else None,
         "error": result.error,
         "notes": result.notes,
+        "hammerhead_coverage_status": result.hammerhead_coverage_status,
+        "hammerhead_coverage_degraded": result.hammerhead_coverage_degraded,
+        "hammerhead_coverage_blockers": result.hammerhead_coverage_blockers,
+        "hammerhead_coverage_degraded_trials": result.hammerhead_coverage_degraded_trials,
+        "hammerhead_coverage_trials": result.hammerhead_coverage_trials,
     }
     (results_dir / f"{result.topology}.json").write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def _with_truth_coverage_summary(results: list[TopologyRunResult]) -> dict:
+    """``hammerhead_coverage_summary`` for the with-truth ``bench_summary.json``.
+
+    Counts the scored topologies (those with metrics) by Hammerhead
+    coverage verdict, lists the degraded ones, and repeats the Hammerhead
+    headline means over the complete-coverage ones as ``*_mean_complete``
+    (``None`` when there are none). The headline means keep every
+    topology, degraded or not.
+    """
+    scored = [r for r in results if r.metrics is not None]
+    block = summarize_hammerhead_coverage(scored)
+    complete = [
+        r.metrics
+        for r in scored
+        if r.metrics is not None and r.hammerhead_coverage_degraded is False
+    ]
+    means = aggregate_many(complete) if complete else {}
+    for key in (
+        "hammerhead_presence_match_rate_mean",
+        "hammerhead_next_hop_match_rate_mean",
+        "hammerhead_protocol_match_rate_mean",
+        "hammerhead_bgp_attr_match_rate_mean",
+    ):
+        block[f"{key}_complete"] = means.get(key)
+    return block
+
+
+def _echo_hammerhead_coverage(a) -> None:
+    """One warning line when Hammerhead flagged the scored answer as degraded."""
+    if a.hammerhead_coverage_degraded is not True:
+        return
+    blockers = "; ".join(a.hammerhead_coverage_blockers or []) or "no blockers named"
+    click.echo(
+        click.style(
+            f"  hammerhead coverage DEGRADED on {a.hammerhead_coverage_degraded_trials}/"
+            f"{a.hammerhead_coverage_trials} trials (scored, flagged): {blockers}",
+            fg="yellow",
+        )
+    )
 
 
 def _print_result(result) -> None:
@@ -154,6 +202,7 @@ def _print_result(result) -> None:
         click.echo(f"  note: {note}")
     if result.vendor_truth_path:
         click.echo(f"  vendor truth: {result.vendor_truth_path}")
+    _echo_hammerhead_coverage(result)
 
 
 @main.command()
@@ -396,7 +445,9 @@ def bench(
         if result.metrics is not None:
             per_topology_metrics.append(result.metrics)
 
-    summary = aggregate_many(per_topology_metrics)
+    summary = aggregate_many(per_topology_metrics) | {
+        "hammerhead_coverage_summary": _with_truth_coverage_summary(results),
+    }
     summary["failed_topologies"] = failed
     (results_dir / "bench_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     click.echo(
@@ -513,6 +564,11 @@ def _run_bench_frr_only_truth(
         "sim_only_fallback_count": len(sim_only_agrees),
         "failed_topologies": failed,
     }
+    # Every scored topology, truth or fallback, by Hammerhead coverage
+    # verdict; the fallback rows also carry it in ``sim_only_summary``.
+    summary["hammerhead_coverage_summary"] = summarize_hammerhead_coverage(
+        [*three_way, *sim_only_agrees]
+    )
     if sim_only_agrees:
         summary["sim_only_summary"] = aggregate_sim_only(sim_only_agrees)
     if three_way:
@@ -596,12 +652,14 @@ def _print_frr_only_truth_result(result: FrrOnlyTruthResult) -> None:
             f"H vs T nh={a.hammerhead_vs_truth_next_hop:.1%}, "
             f"B vs H nh={a.batfish_vs_hammerhead_next_hop:.1%}"
         )
+        _echo_hammerhead_coverage(a)
     elif result.sim_only_agreement is not None:
         a = result.sim_only_agreement
         click.echo(
             f"  B={a.batfish_routes} H={a.hammerhead_routes} routes. "
             f"nh_agree={a.next_hop_agreement:.1%}"
         )
+        _echo_hammerhead_coverage(a)
 
 
 def _write_sim_only_result(result: SimOnlyResult, results_dir: Path) -> None:
@@ -651,6 +709,7 @@ def _print_sim_only_result(result: SimOnlyResult) -> None:
             f"nh_agree={a.next_hop_agreement:.1%}, proto_agree={a.protocol_agreement:.1%}, "
             f"bgp_attr_agree={a.bgp_attr_agreement:.1%}"
         )
+        _echo_hammerhead_coverage(a)
         if a.batfish_wall_s is not None and a.hammerhead_wall_s is not None:
             if a.trial_stats is not None:
                 bf = a.trial_stats.get("batfish_wall_s") or {}
