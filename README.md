@@ -561,6 +561,15 @@ fails to parse on v0.2.0 and v0.2.1 alike); without a licence it fails
 with the message above. The Batfish side was not re-run for this
 revision.
 
+From Hammerhead v0.2.2, `simulate --emit-rib all` exits 3 when the
+configs hold lines the model does not read, after printing the full
+answer, with a top-level `coverage` object saying so. The harness
+scores that answer and flags the trial: `hammerhead_stats.json`
+carries `coverage_status`, `coverage_degraded` and
+`coverage_blockers` (all `null` against an earlier release). An exit
+3 whose JSON does not say `coverage.degraded`, or any other non-zero
+code, still fails the run.
+
 Each `results/<topology>.json` carries the topology, status, mode
 and start/finish times, paths to both tools' per-node FIB dumps and
 the per-prefix diff, and an `agreement` block: route and key counts,
