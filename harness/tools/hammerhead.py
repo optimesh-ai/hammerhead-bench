@@ -120,6 +120,13 @@ class HammerheadStats:
       fed ``peak_rss_mb``. For ``rusage`` this is 1 (one pre/post
       pair); for the docker-stats sampler on the Batfish side it's
       the poll count. Zero iff ``peak_rss_mb is None``.
+    * ``coverage_status`` / ``coverage_degraded`` / ``coverage_blockers``
+      — the snapshot's coverage verdict from the bulk response's
+      top-level ``coverage`` object (Hammerhead v0.2.2+). A degraded
+      trial is one whose configs hold lines the model does not read:
+      ``simulate`` exits 3 and still prints the RIBs, which are scored,
+      and flagged here so a report can tell them apart. ``None`` when the
+      response carries no ``coverage`` (Hammerhead before v0.2.2).
     """
 
     topology: str
@@ -132,6 +139,9 @@ class HammerheadStats:
     peak_rss_mb: int | None = None
     peak_rss_source: str | None = None
     peak_rss_sample_count: int = 0
+    coverage_status: str | None = None
+    coverage_degraded: bool | None = None
+    coverage_blockers: list[str] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -154,6 +164,11 @@ class HammerheadRunner(Protocol):
 
             {"rib": {"<hostname>": {"hostname": "...", "entries": [...]}}}
         """
+
+
+#: ``hammerhead simulate`` exit code for a full answer over a snapshot whose
+#: coverage is degraded (preflight's ``unknown``; Hammerhead v0.2.2+).
+EXIT_COVERAGE_DEGRADED = 3
 
 
 @dataclass(slots=True)
@@ -184,6 +199,17 @@ class SubprocessHammerheadRunner:
             ],
             cfg.timeout_s,
         )
+        # Exit 3 (v0.2.2+) is the full answer over a degraded snapshot:
+        # accepted only when the JSON says ``coverage.degraded``. Any other
+        # non-zero code, or a 3 without that, is a failure.
+        if rc == EXIT_COVERAGE_DEGRADED:
+            try:
+                bulk = _parse_json(out, origin="hammerhead simulate --emit-rib all")
+            except RuntimeError:
+                bulk = None
+            cov = bulk.get("coverage") if bulk is not None else None
+            if isinstance(cov, dict) and cov.get("degraded") is True:
+                return bulk  # type: ignore[return-value]
         if rc != 0:
             raise RuntimeError(
                 f"hammerhead simulate --emit-rib all failed (rc={rc}): {err or out}"
@@ -279,6 +305,15 @@ def run_hammerhead(
     sim_s = time.monotonic() - t_sim
 
     rib_map = _extract_rib_map(bulk)
+    cov = bulk.get("coverage")
+    coverage = cov if isinstance(cov, dict) else None
+    if coverage is not None and coverage.get("degraded") is True:
+        log.warning(
+            "hammerhead: %s: coverage DEGRADED (%s); RIBs scored as answered, "
+            "trial flagged",
+            topology,
+            "; ".join(str(b) for b in coverage.get("blockers") or []) or "no blockers named",
+        )
 
     if expected_hostnames is not None:
         expected = {h.strip() for h in expected_hostnames if h and h.strip()}
@@ -317,6 +352,15 @@ def run_hammerhead(
         peak_rss_mb=peak_reading.mb,
         peak_rss_source=peak_reading.source if peak_reading.mb is not None else None,
         peak_rss_sample_count=peak_reading.sample_count,
+        coverage_status=(
+            str(coverage["status"]) if coverage and "status" in coverage else None
+        ),
+        coverage_degraded=(
+            bool(coverage["degraded"]) if coverage and "degraded" in coverage else None
+        ),
+        coverage_blockers=(
+            [str(b) for b in coverage.get("blockers") or []] if coverage else None
+        ),
     )
     (out_dir / "hammerhead_stats.json").write_text(
         json.dumps(stats.as_dict(), indent=2) + "\n"

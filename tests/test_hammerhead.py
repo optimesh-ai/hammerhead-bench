@@ -350,3 +350,71 @@ def test_stats_type_is_hammerhead_stats(tmp_path: Path) -> None:
         tmp_path / "cfg", tmp_path / "out", topology="t", runner=runner
     )
     assert isinstance(stats, HammerheadStats)
+
+
+# --- coverage (Hammerhead v0.2.2: `simulate` exits 3 on a degraded snapshot)
+
+
+def _degraded_bulk() -> dict[str, Any]:
+    bulk = _bulk_view({"r1": []})
+    bulk["coverage"] = {
+        "status": "degraded",
+        "degraded": True,
+        "affected_devices": ["r1"],
+        "unparsed_forwarding_relevant": {"r1": [[7, "frobnicate"]]},
+        "blockers": ["r1: 1 unparsed forwarding-relevant line"],
+    }
+    return bulk
+
+
+def test_subprocess_runner_accepts_rc3_when_coverage_says_degraded(
+    tmp_path: Path,
+) -> None:
+    def fake_run(_cmd: list[str], _timeout_s: float) -> tuple[int, str, str]:
+        return 3, json.dumps(_degraded_bulk()), "coverage DEGRADED: ..."
+
+    runner = SubprocessHammerheadRunner(run_cmd=fake_run)
+    stats = run_hammerhead(
+        tmp_path / "cfg", tmp_path / "out", topology="t", runner=runner
+    )
+    assert stats.device_count == 1
+    assert stats.coverage_status == "degraded"
+    assert stats.coverage_degraded is True
+    assert stats.coverage_blockers == ["r1: 1 unparsed forwarding-relevant line"]
+    data = json.loads((tmp_path / "out" / "hammerhead_stats.json").read_text())
+    assert data["coverage_degraded"] is True
+
+
+def test_subprocess_runner_rc3_without_degraded_coverage_raises(
+    tmp_path: Path,
+) -> None:
+    # Exit 3 whose JSON does not say `coverage.degraded` is not an answer
+    # over a degraded snapshot; it is a failure.
+    def fake_run(_cmd: list[str], _timeout_s: float) -> tuple[int, str, str]:
+        return 3, json.dumps(_bulk_view({"r1": []})), "boom"
+
+    runner = SubprocessHammerheadRunner(run_cmd=fake_run)
+    with pytest.raises(RuntimeError, match="rc=3"):
+        run_hammerhead(
+            tmp_path / "cfg", tmp_path / "out", topology="t", runner=runner
+        )
+
+
+def test_clean_run_records_complete_coverage(tmp_path: Path) -> None:
+    bulk = _bulk_view({"r1": []})
+    bulk["coverage"] = {"status": "complete", "degraded": False, "blockers": []}
+    runner = _FakeRunner(bulk_view=bulk)
+    stats = run_hammerhead(
+        tmp_path / "cfg", tmp_path / "out", topology="t", runner=runner
+    )
+    assert stats.coverage_status == "complete"
+    assert stats.coverage_degraded is False
+
+
+def test_pre_v022_output_without_coverage_is_not_measured(tmp_path: Path) -> None:
+    runner = _FakeRunner(bulk_view=_bulk_view({"r1": []}))
+    stats = run_hammerhead(
+        tmp_path / "cfg", tmp_path / "out", topology="t", runner=runner
+    )
+    assert stats.coverage_status is None
+    assert stats.coverage_degraded is None
