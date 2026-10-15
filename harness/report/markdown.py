@@ -191,7 +191,7 @@ def _sim_only_headline_block(summary: dict[str, Any]) -> list[str]:
             + " The last column repeats the covered-only means over the "
             f"**{cov.get('covered_complete_topology_count', 0)}** covered "
             "topologies whose Hammerhead coverage was complete (`-` when there "
-            "are none); the other two keep every topology."
+            "are none); the other two keep degraded topologies."
         )
         lines.append("")
     elif cov:

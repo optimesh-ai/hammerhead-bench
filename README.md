@@ -650,7 +650,7 @@ hardware. Record them alongside any number you publish.
 
 ```bash
 uv sync --all-extras --dev
-uv run pytest                     # 299 passed, 1 skipped (2026-10-15)
+uv run pytest                     # 300 passed, 1 skipped (2026-10-15)
 uv run ruff check .
 ```
 

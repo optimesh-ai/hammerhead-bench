@@ -2103,12 +2103,6 @@ def aggregate_sim_only(per_topology: list[SimOnlyAgreement]) -> dict:
     qualifies (e.g. every verdict is unknown).
     """
     n = len(per_topology)
-    if n == 0:
-        return {"topology_count": 0}
-
-    def _mean(xs: list[float]) -> float:
-        return sum(xs) / len(xs) if xs else 1.0
-
     covered = [a for a in per_topology if a.both_sides_keys > 0]
     covered_complete = [a for a in covered if a.hammerhead_coverage_degraded is False]
     hammerhead_coverage_summary = summarize_hammerhead_coverage(per_topology)
@@ -2126,6 +2120,13 @@ def aggregate_sim_only(per_topology: list[SimOnlyAgreement]) -> dict:
             ),
         }
     )
+    if n == 0:
+        # Every topology failed before scoring; keep the coverage block so
+        # bench_summary.json has the same shape on an empty run.
+        return {"topology_count": 0, "hammerhead_coverage_summary": hammerhead_coverage_summary}
+
+    def _mean(xs: list[float]) -> float:
+        return sum(xs) / len(xs) if xs else 1.0
 
     # Trial count is uniform across topologies within a single bench run
     # (CLI passes --trials N to every topology). Surface it at the summary
